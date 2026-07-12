@@ -1,0 +1,132 @@
+<USER_REQUEST>
+记住这个步骤，我等下给你发数据，把下面整段发给 Gemini：
+
+```text
+目标：让 current_vel_z 同时低延迟、准确、不漂。请基于日志做离线 EKF 回放分析，不凭飞行体感猜参数。
+
+当前代码结构：
+1. 50Hz 高度 EKF，状态 [z, vz]
+2. IMU 世界 Z 加速度预测：
+   acc_raw -> bias修正 -> LPF -> ACC_GAIN -> 积分
+3. ToF 同时提供：
+   - 高度位置观测
+   - 高度差分速度观测
+4. 使用真实 timestamp，不假定固定 20ms
+
+数据采集：
+- 解锁自动开始
+- 50Hz RAM 环形缓冲
+- 最多400点，约8秒
+- ISR只写内存
+- 上锁后导出CSV
+- 完整段位于 HEIGHT_LOG_BEGIN 和 HEIGHT_LOG_END 之间
+
+CSV字段：
+seq,time_us,tof_cm,height_cm,ekf_z_cm,ekf_vz_cm_s,
+acc_raw_cm_s2,acc_corrected_cm_s2,acc_lpf_cm_s2,
+acc_ekf_cm_s2,tof_diff_cm_s,innov_cm,throttle,
+target_vz_cm_s,tof_used,armed
+
+注意：
+- 无线串口可能拆行，需要按 “seq,time_us” 恢复记录。
+- 本次日志恢复206/210点。
+- 实际采样间隔中值约26ms，即38.5Hz，不是标称50Hz。
+- 所有回放必须使用time_us真实dt。
+
+参考速度生成：
+- 对projected height_cm做非因果、零相位局部多项式平滑。
+- 求解析导数得到vel_z_ref。
+- vel_z_ref只是ToF参考代理，不是独立绝对真值。
+- 使用0.40、0.55、0.70秒三种窗口检查参数稳健性。
+
+回放：
+- Python严格复刻C版2状态EKF。
+- 初始P=diag(100,100)。
+- 预测：
+  z += vz*dt + 0.5*acc*dt²
+  vz += acc*dt
+- 协方差预测与C代码相同。
+- 先融合ToF高度。
+- 再可选融合ToF差分速度。
+- 使用真实timestamp。
+
+优化指标：
+cost =
+  RMSE(vz_est, vel_z_ref)
+  + 0.015 * abs(lag_ms)
+  + 0.35 * quiet_velocity_RMS
+
+扫描参数：
+ACC_GAIN
+ACC_LPF_ALPHA
+Q_Z
+Q_VZ
+R_Z
+TOF_VEL_OBS
+TOF_VEL_LPF_ALPHA
+R_VZ
+
+旧参数：
+ACC_GAIN=0.20
+ACC_LPF_ALPHA=0.12
+Q_Z=40
+Q_VZ=300
+R_Z=25
+TOF_VEL_OBS=1
+TOF_VEL_LPF_ALPHA=0.35
+R_VZ=350
+
+旧参数结果：
+RMSE≈3.09cm/s
+lag≈182ms
+quiet RMS≈2.36cm/s
+
+三组真值窗口的共同趋势：
+- ACC_GAIN保持0.20
+- ACC_LPF_ALPHA约0.22
+- Q_VZ提高到600
+- R_Z降低到12.5
+- TOF速度LPF alpha提高到0.55
+- R_VZ降低到150
+- Q_Z约15
+
+选择的新参数：
+ACC_GAIN=0.20
+ACC_LPF_ALPHA=0.22
+Q_Z=15
+Q_VZ=600
+R_Z=12.5
+TOF_VEL_OBS=1
+TOF_VEL_LPF_ALPHA=0.55
+R_VZ=150
+
+新参数离线结果：
+RMSE≈1.80cm/s
+lag≈78ms
+quiet RMS≈1.49cm/s
+
+提升：
+RMSE约下降42%
+延迟约下降57%
+
+请分析：
+1. 回放数学是否严格匹配C代码。
+2. cost权重是否合理。
+3. 是否存在用ToF生成真值、同时融合ToF造成的评价偏置。
+4. 新参数是否可能过度信任ToF差分速度。
+5. 如何设计第二份独立日志验证，避免过拟合。
+6. 是否需要升级为[z,vz,acc_bias_z]三状态EKF。
+7. 不要直接建议ACC_GAIN=1；已有飞行数据证明关闭ToF速度观测并提高GAIN会明显恶化。
+```
+
+附上：
+
+- 原始 `pasted-text.txt`
+- `project/tools/ekf_tuner.py`
+- `project/tools/ekf_tuner_out/grid_results.csv`
+- `project/code/tof.c`
+- `project/code/tof.h`
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-06-24T22:24:10+08:00.
+</ADDITIONAL_METADATA>

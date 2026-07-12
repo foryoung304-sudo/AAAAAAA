@@ -1,0 +1,6 @@
+{
+    "C_Cpp.default.configurationProvider": "iarsystems.iar-build",
+    "C_Cpp.default.compilerPath": "cl.exe",
+    "C_Cpp.errorSquiggles": "disabled",
+    "Codegeex.RepoIndex": true
+}

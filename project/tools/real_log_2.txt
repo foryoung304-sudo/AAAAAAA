@@ -1,0 +1,2 @@
+HEIGHT_LOG_BEGIN")
+62:     end = text.find("HEIGHT_LOG_END
