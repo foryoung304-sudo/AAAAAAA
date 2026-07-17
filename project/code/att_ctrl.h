@@ -7,7 +7,7 @@
 
 #define MAX_ROLLING_SPEED 50.0f
 #define MAX_ANGLE     30.0f        // 最大角度限制
-#define MAX_YAW_SPEED 5.0f       // 最大偏航速度
+#define MAX_YAW_SPEED 7.0f       // 最大偏航速度
 #define MAX_ATT1_VAL   10.0f        // 角速率环最大输出 (°/s)
 #define MAX_YAW_CT_VAL 7.0f        // 偏航控制输出最大
   
@@ -22,6 +22,7 @@ typedef struct {
 } attitude_control_t;
 
 extern attitude_control_t att_ctrl;// 角度环数据结构
+extern float att_voltage_output_scale;
 typedef struct 
 {
     float exp_rol;
@@ -42,6 +43,7 @@ typedef struct
     float exp_ang_vel[3];
     float fb_ang_vel[3];
     float set_yaw_speed;
+    float sp_rate_ff[2];       // Roll/Pitch setpoint-rate feedforward (deg/s)
 } att_1l_ct_t;
 
 extern att_2l_ct_t att_2l_ct;

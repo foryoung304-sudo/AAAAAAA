@@ -15,10 +15,19 @@ void prase_remote_ctrl_data(float dT_s)
 
     if(!lora3a22_state_flag)
     {
-        vehicle_state.armed = 0;
-        auto_landing_request = 0u;
-        auto_landing_active = 0u;
-        preflight_error_flags = 0u;
+        /* A lost radio link must not cut all motors while airborne.  Let the
+         * normal auto-land state machine keep attitude and vertical control
+         * until its guarded near-ground disarm condition is reached. */
+        if(vehicle_state.armed != 0u)
+        {
+            auto_landing_request = 1u;
+        }
+        else
+        {
+            auto_landing_request = 0u;
+            auto_landing_active = 0u;
+            preflight_error_flags = 0u;
+        }
         arm_switch_seen_locked = 0u;
         last_arm_switch = 0u;
         manual_input.roll = 0.0f;
@@ -38,11 +47,11 @@ void prase_remote_ctrl_data(float dT_s)
         auto_landing_request = 0u;
         auto_landing_active = 0u;
 #else
-        if((vehicle_state.armed != 0u) &&
-           ((auto_landing_request != 0u) ||
-            (auto_landing_active != 0u) ||
-            (vehicle_state.current_height > AUTO_LAND_TRIGGER_HEIGHT_CM)))
+        if(vehicle_state.armed != 0u)
         {
+            /* The lock switch is a land request in every armed state.  The
+             * guarded auto-land path decides when it is actually safe to
+             * disarm; never use this switch as an in-air motor kill. */
             auto_landing_request = 1u;
         }
         else

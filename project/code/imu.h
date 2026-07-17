@@ -32,7 +32,8 @@ typedef struct {
     float gyro_offset_actual[3];  // 映射到机体系后的陀螺仪零偏，单位 deg/s
     
     // 陀螺仪实际值
-    float gyro_actual[3];  // [0]=x, [1]=y, [2]=z
+    float gyro_actual[3];  // 25 Hz低通后的机体系角速度，供姿态/Rate环使用
+    float gyro_unfiltered[3]; // 已映射并去零偏的机体系角速度，供传感器帧积分
     // 陀螺仪原始值
     int16_t gyro_data[3];  // [0]=x, [1]=y, [2]=z
     //陀螺仪真实值（去偏移）

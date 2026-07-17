@@ -37,7 +37,22 @@ static uint8_t alt_landed_raw(void)
         return 1u;
     }
 
-    return (throttle_ramped_debug < (system_get_hover_throttle_base() - ALT_LANDED_THR_MARGIN));
+    /* Low throttle is normal during a commanded descent.  It is evidence of
+     * landing only when the aircraft is also close to the floor and no longer
+     * moving vertically.  Without these gates ALT_PHASE_LANDED can be reached
+     * in the air and param_update() will correctly-but-dangerously disarm. */
+    if(vehicle_state.current_height > AUTO_LAND_DISARM_HEIGHT_CM)
+    {
+        return 0u;
+    }
+
+    if(fabsf(vehicle_state.current_vel_z) > AUTO_LAND_DISARM_VEL_CM_S)
+    {
+        return 0u;
+    }
+
+    return (throttle_ramped_debug <
+            (system_get_hover_throttle_base() - ALT_LANDED_THR_MARGIN)) ? 1u : 0u;
 }
 
 static void alt_landed_update(float dT_s)
@@ -292,9 +307,13 @@ void alt_2level_ctrl(float dT_s)
 
             if(alt_rt.alt_profile_started == 0u)
             {
-                if((alt_phase == ALT_PHASE_TAKEOFF ||
-                    alt_phase == ALT_PHASE_HOLD) &&
-                   vehicle_state.current_height >= ALT_TAKEOFF_COMPLETE_HEIGHT_CM)
+                /* TAKEOFF must start its trajectory immediately.  Waiting
+                 * until 10 cm while pinning the profile to current height
+                 * makes the height error zero and prevents liftoff boost. */
+                if((alt_phase == ALT_PHASE_TAKEOFF) ||
+                   ((alt_phase == ALT_PHASE_HOLD) &&
+                    (vehicle_state.current_height >=
+                     ALT_TAKEOFF_COMPLETE_HEIGHT_CM)))
                 {
                     alt_rt.alt_profile_started = 1u;
                     alt_rt.alt_profile_height_cm = vehicle_state.current_height;
@@ -720,8 +739,9 @@ void alt_1level_ctrl(float dT_s)
         vehicle_setpoint.target_throttle;
 
     if((alt_phase == ALT_PHASE_TAKEOFF) &&
-       (vehicle_state.current_height < ALT_TAKEOFF_BOOST_HEIGHT_CM ) &&
-       (alt_2l_ct.height_err > ALT_TAKEOFF_BOOST_MIN_ERR_CM))
+       (vehicle_state.current_height < ALT_TAKEOFF_BOOST_HEIGHT_CM) &&
+       ((vehicle_setpoint.target_height - vehicle_state.current_height) >
+        ALT_TAKEOFF_BOOST_MIN_ERR_CM))
     {
         float boost_weight = 1.0f;
         float takeoff_min_throttle;

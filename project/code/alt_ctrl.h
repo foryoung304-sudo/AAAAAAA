@@ -15,7 +15,7 @@
 #define ALT_TRANSITION_HEIGHT_CM         30.0f
 #define ALT_AUTHORITY_MIN                0.85f
 #define ALT_THROTTLE_AUTHORITY_RANGE     5.0f
-#define ALT_MAX_THROTTLE_HEADROOM        4.0f
+#define ALT_MAX_THROTTLE_HEADROOM        8.0f
 #define ALT_VEL_DAMPING_GAIN             0.036f
 #define ALT_DYN_GAIN_REF_VOLTAGE         10.5f
 #define ALT_DYN_GAIN_SCALE_MIN           0.75f
@@ -23,9 +23,7 @@
 #define ALT_VEL_CMD_LIMIT_CM_S           10.0f
 #define ALT_VEL_CMD_SLEW_CM_S2           8.0f
 #define ALT_VEL_I_DISABLED_DECAY         1.0f
-// Only unload an I term that opposes the current vertical-velocity error.
-// 0.99 at 50 Hz is deliberately gentle: it preserves normal descent/climb
-// bias while preventing stale I from carrying through a height crossing.
+
 #define ALT_VEL_I_OPPOSE_DECAY           0.99f
 #define ALT_TRAJ_MAX_CLIMB_CM_S          10.0f
 #define ALT_TRAJ_MAX_DESCEND_CM_S        8.0f
@@ -58,8 +56,8 @@
 #define ALT_TAKEOFF_BOOST_HEIGHT_CM      8.5f
 #define ALT_TAKEOFF_MIN_HEADROOM         1.2f
 #define ALT_TAKEOFF_HEADROOM_SLEW        2.0f
-#define ALT_TAKEOFF_BOOST_FADE_VEL_CM_S  0.8f
-#define ALT_TAKEOFF_VEL_CMD_LIMIT_CM_S   3.0f
+#define ALT_TAKEOFF_BOOST_FADE_VEL_CM_S  3.0f
+#define ALT_TAKEOFF_VEL_CMD_LIMIT_CM_S   5.0f
 #define ALT_TAKEOFF_VEL_LIMIT_HEIGHT_CM  13.0f
 #define ALT_TAKEOFF_BOOST_MIN_ERR_CM     0.8f
 #define ALT_TAKEOFF_COMPLETE_ERR_CM      0.4f
@@ -68,7 +66,7 @@
 #define ALT_SPOOLING_TIMEOUT_S           0.50f
 #define AUTO_LAND_DESCEND_SPEED_CM_S     10.0f
 #define AUTO_LAND_MIN_DESCEND_CMD_CM_S   3.0f
-#define AUTO_LAND_MIN_DESCEND_HEIGHT_CM  8.0f
+#define AUTO_LAND_MIN_DESCEND_HEIGHT_CM  6.5f
 #define ALT_BRAKE_ACCEL_CM_S2            15.0f
 
 typedef enum

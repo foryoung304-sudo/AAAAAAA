@@ -43,6 +43,8 @@ typedef struct
     uint8_t update;
     uint32_t byte_count;
     uint32_t frame_count;
+    uint32_t last_frame_start_rx_us;
+    uint32_t last_frame_rx_us;
     uint32_t checksum_error_count;
 }lc302_data_t;
 
@@ -53,7 +55,9 @@ void lc302_uart_callback(void);
 void lc302_update(void);
 void lc302_get_motion(float *dx, float *dy, uint8_t *valid, uint8_t *quality,
                       uint16_t *count, uint32_t *integration_us,
-                      uint32_t *frame_count);
+                      uint32_t *frame_count,
+                      uint32_t *last_frame_start_rx_us,
+                      uint32_t *last_frame_rx_us);
 void lc302_debug_print(void);
 
 #endif

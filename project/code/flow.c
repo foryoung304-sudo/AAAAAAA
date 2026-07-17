@@ -15,6 +15,100 @@ static float flow_gyro_int_z = 0.0f;
 
 typedef struct
 {
+    uint32_t time_us;
+    float angle_x_rad;
+    float angle_y_rad;
+    float angle_z_rad;
+} flow_gyro_history_sample_t;
+
+static flow_gyro_history_sample_t flow_gyro_history[FLOW_GYRO_HISTORY_LEN];
+static uint16_t flow_gyro_history_head = 0u;
+static uint16_t flow_gyro_history_count = 0u;
+static float flow_gyro_cumulative_x = 0.0f;
+static float flow_gyro_cumulative_y = 0.0f;
+static float flow_gyro_cumulative_z = 0.0f;
+
+static uint8_t flow_gyro_history_value_at(uint32_t target_us,
+                                          float *angle_x_rad,
+                                          float *angle_y_rad,
+                                          float *angle_z_rad)
+{
+    uint16_t i;
+    uint16_t oldest;
+    flow_gyro_history_sample_t previous;
+
+    if(flow_gyro_history_count < 2u)
+    {
+        return 0u;
+    }
+
+    oldest = (uint16_t)((flow_gyro_history_head + FLOW_GYRO_HISTORY_LEN -
+                         flow_gyro_history_count) % FLOW_GYRO_HISTORY_LEN);
+    previous = flow_gyro_history[oldest];
+    if((int32_t)(target_us - previous.time_us) < 0)
+    {
+        return 0u;
+    }
+
+    for(i = 1u; i < flow_gyro_history_count; i++)
+    {
+        uint16_t index = (uint16_t)((oldest + i) % FLOW_GYRO_HISTORY_LEN);
+        flow_gyro_history_sample_t current = flow_gyro_history[index];
+
+        if((int32_t)(target_us - current.time_us) <= 0)
+        {
+            uint32_t span_us = current.time_us - previous.time_us;
+            float alpha = 0.0f;
+            if(span_us > 0u)
+            {
+                alpha = (float)(target_us - previous.time_us) / (float)span_us;
+                alpha = LIMIT(alpha, 0.0f, 1.0f);
+            }
+            *angle_x_rad = previous.angle_x_rad +
+                (current.angle_x_rad - previous.angle_x_rad) * alpha;
+            *angle_y_rad = previous.angle_y_rad +
+                (current.angle_y_rad - previous.angle_y_rad) * alpha;
+            *angle_z_rad = previous.angle_z_rad +
+                (current.angle_z_rad - previous.angle_z_rad) * alpha;
+            return 1u;
+        }
+        previous = current;
+    }
+
+    return 0u;
+}
+
+static uint8_t flow_gyro_history_delta(uint32_t start_us,
+                                       uint32_t end_us,
+                                       float *delta_x_rad,
+                                       float *delta_y_rad,
+                                       float *delta_z_rad)
+{
+    float start_x;
+    float start_y;
+    float start_z;
+    float end_x;
+    float end_y;
+    float end_z;
+
+    if((end_us == 0u) || ((int32_t)(end_us - start_us) <= 0))
+    {
+        return 0u;
+    }
+    if((flow_gyro_history_value_at(start_us, &start_x, &start_y, &start_z) == 0u) ||
+       (flow_gyro_history_value_at(end_us, &end_x, &end_y, &end_z) == 0u))
+    {
+        return 0u;
+    }
+
+    *delta_x_rad = end_x - start_x;
+    *delta_y_rad = end_y - start_y;
+    *delta_z_rad = end_z - start_z;
+    return 1u;
+}
+
+typedef struct
+{
     float tilt_gate;
     float yaw_gate;
 
@@ -59,14 +153,34 @@ static flow_debug_t flow_debug = {0};
 
 void flow_gyro_integrate(float dT_s)
 {
+    flow_gyro_history_sample_t *sample;
+    const float deg_to_rad = 3.1415926f / 180.0f;
+
     if(dT_s <= 0.0f || dT_s > 0.01f)
     {
         return;
     }
 
-    flow_gyro_int_x += imu_data.gyro_actual[0] * (3.1415926f / 180.0f) * dT_s;
-    flow_gyro_int_y += imu_data.gyro_actual[1] * (3.1415926f / 180.0f) * dT_s;
-    flow_gyro_int_z += imu_data.gyro_actual[2] * (3.1415926f / 180.0f) * dT_s;
+    /* Optical-flow rotation compensation needs the gyro delta accumulated
+     * over the same sensor-frame interval as the image flow. */
+    flow_gyro_int_x += imu_data.gyro_unfiltered[0] * deg_to_rad * dT_s;
+    flow_gyro_int_y += imu_data.gyro_unfiltered[1] * deg_to_rad * dT_s;
+    flow_gyro_int_z += imu_data.gyro_unfiltered[2] * deg_to_rad * dT_s;
+
+    flow_gyro_cumulative_x += imu_data.gyro_unfiltered[0] * deg_to_rad * dT_s;
+    flow_gyro_cumulative_y += imu_data.gyro_unfiltered[1] * deg_to_rad * dT_s;
+    flow_gyro_cumulative_z += imu_data.gyro_unfiltered[2] * deg_to_rad * dT_s;
+    sample = &flow_gyro_history[flow_gyro_history_head];
+    sample->time_us = system_time_us();
+    sample->angle_x_rad = flow_gyro_cumulative_x;
+    sample->angle_y_rad = flow_gyro_cumulative_y;
+    sample->angle_z_rad = flow_gyro_cumulative_z;
+    flow_gyro_history_head =
+        (uint16_t)((flow_gyro_history_head + 1u) % FLOW_GYRO_HISTORY_LEN);
+    if(flow_gyro_history_count < FLOW_GYRO_HISTORY_LEN)
+    {
+        flow_gyro_history_count++;
+    }
 }
 
 // 更新光流位置和速度
@@ -112,15 +226,20 @@ void update_position_from_flow(float dT_s)
     uint16_t lc302_accum_count = 0u;
     uint32_t lc302_integration_us = 0u;
     uint32_t lc302_frame_count = 0u;
+    uint32_t lc302_last_frame_start_rx_us = 0u;
+    uint32_t lc302_last_frame_rx_us = 0u;
     
     lc302_get_motion(&lc302_delta_x, &lc302_delta_y, &flow_valid, &flow_quality,
                      &lc302_accum_count, &lc302_integration_us,
-                     &lc302_frame_count);
+                     &lc302_frame_count, &lc302_last_frame_start_rx_us,
+                     &lc302_last_frame_rx_us);
     flow_health.raw_valid = (flow_valid != 0u) ? 1u : 0u;
     flow_health.quality = flow_quality;
     flow_health.lc302_accum_count = lc302_accum_count;
     flow_health.lc302_integration_us = lc302_integration_us;
     flow_health.lc302_frame_count = lc302_frame_count;
+    flow_health.lc302_frame_start_rx_us = lc302_last_frame_start_rx_us;
+    flow_health.lc302_frame_rx_us = lc302_last_frame_rx_us;
 
     // The LC302 runs independently from the 50 Hz control loop.  A zero
     // accumulation count means that no new sensor frame has arrived since
@@ -240,6 +359,64 @@ void update_position_from_flow(float dT_s)
     float d_theta_x = flow_gyro_int_x; // Roll 旋转
     float d_theta_y = flow_gyro_int_y; // Pitch 旋转
     float d_theta_z = flow_gyro_int_z; // Yaw 旋转
+    {
+        static uint32_t gyro_history_hit_count = 0u;
+        static uint32_t gyro_history_fallback_count = 0u;
+        static const uint32_t shadow_delay_us[FLOW_GYRO_SHADOW_COUNT] =
+            {0u, 10000u, 20000u, 30000u, 40000u, 50000u};
+        uint32_t gyro_window_us = lc302_integration_us;
+        uint32_t gyro_window_min_us =
+            (uint32_t)((float)lc302_accum_count * FLOW_LC302_MIN_FRAME_DT_S * 1000000.0f);
+        uint32_t gyro_window_max_us =
+            (uint32_t)((float)lc302_accum_count * FLOW_LC302_MAX_FRAME_DT_S * 1000000.0f);
+
+        if((gyro_window_us < gyro_window_min_us) ||
+           (gyro_window_us > gyro_window_max_us))
+        {
+            gyro_window_us = (uint32_t)((float)lc302_accum_count *
+                FLOW_LC302_NOMINAL_FRAME_DT_S * 1000000.0f);
+        }
+
+        /* UART's first byte is the closest observable upper bound on the
+         * exposure end.  The final byte is transport-delayed by a complete
+         * packet and must never anchor the compensation window. */
+        if((lc302_last_frame_start_rx_us != 0u) &&
+           (flow_gyro_history_delta(lc302_last_frame_start_rx_us - gyro_window_us,
+                                    lc302_last_frame_start_rx_us,
+                                    &d_theta_x, &d_theta_y, &d_theta_z) != 0u))
+        {
+            gyro_history_hit_count++;
+            flow_health.gyro_history_selected_hit = 1u;
+        }
+        else
+        {
+            /* Keep the legacy 50 Hz accumulator only as an observable safe
+             * fallback while history is filling or a timestamp is outside it. */
+            gyro_history_fallback_count++;
+            flow_health.gyro_history_selected_hit = 0u;
+        }
+
+        flow_health.gyro_history_hit_count = gyro_history_hit_count;
+        flow_health.gyro_history_fallback_count = gyro_history_fallback_count;
+        flow_health.gyro_shadow_hit_mask = 0u;
+        for(uint8_t shadow = 0u; shadow < FLOW_GYRO_SHADOW_COUNT; shadow++)
+        {
+            float shadow_dx;
+            float shadow_dy;
+            float shadow_dz;
+            uint32_t shadow_end_us = lc302_last_frame_start_rx_us -
+                                     shadow_delay_us[shadow];
+            if((lc302_last_frame_start_rx_us != 0u) &&
+               (flow_gyro_history_delta(shadow_end_us - gyro_window_us,
+                                        shadow_end_us,
+                                        &shadow_dx, &shadow_dy, &shadow_dz) != 0u))
+            {
+                flow_health.gyro_shadow_hit_mask |= (uint8_t)(1u << shadow);
+                flow_health.gyro_comp_y_shadow_cm[shadow] =
+                    -shadow_dx * vehicle_state.current_height * FLOW_GYRO_COMP_GAIN_Y;
+            }
+        }
+    }
 #if FLOW_RP_USE_ATTITUDE_DELTA
     static uint8_t rp_delta_inited = 0u;
     static float last_roll_deg = 0.0f;
@@ -312,6 +489,12 @@ void update_position_from_flow(float dT_s)
     // 3. 陀螺仪视觉补偿 
     float gyro_disp_x =  d_theta_y * height_actual * FLOW_GYRO_COMP_GAIN_X; // Pitch 旋转引起的X轴假位移
     float gyro_disp_y = -d_theta_x * height_actual * FLOW_GYRO_COMP_GAIN_Y; // Roll 旋转引起的Y轴假位移
+
+    for(uint8_t shadow = 0u; shadow < FLOW_GYRO_SHADOW_COUNT; shadow++)
+    {
+        flow_health.true_dy_shadow_cm[shadow] =
+            flow_dy_raw - flow_health.gyro_comp_y_shadow_cm[shadow];
+    }
 
     float flow_dx_before_gate = flow_dx_raw;
     float flow_dy_before_gate = flow_dy_raw;
@@ -600,10 +783,45 @@ void flow_debug_print(void)
 {
 #if FLOW_DEBUG_ENABLE
     static uint32_t debug_count = 0;
+    static uint32_t last_bench_frame_count = 0u;
 
     if((debug_count++ % FLOW_DEBUG_DIV) != 0u)
     {
         return;
+    }
+
+    /* Prop-stopped bench evidence only.  Print once per new LC302 frame and
+     * never add UART load while armed.  cN/tN are compensation and raw-comp
+     * for exposure-end delays N={0,10,20,30,40,50} ms from the first byte. */
+    if((vehicle_state.armed == 0u) &&
+       (flow_health.lc302_accum_count != 0u) &&
+       (flow_health.lc302_frame_count != last_bench_frame_count))
+    {
+        uint32_t wire_us = flow_health.lc302_frame_rx_us -
+                           flow_health.lc302_frame_start_rx_us;
+        last_bench_frame_count = flow_health.lc302_frame_count;
+        printf("[FLOW_BENCH] frame=%lu,wire_us=%lu,int_us=%lu,raw_y=%.5f,comp_y=%.5f,true_y=%.5f,sel_hit=%u,shadow_mask=0x%02X,hits=%lu,fallbacks=%lu,c0=%.5f,c10=%.5f,c20=%.5f,c30=%.5f,c40=%.5f,c50=%.5f,t0=%.5f,t10=%.5f,t20=%.5f,t30=%.5f,t40=%.5f,t50=%.5f\r\n",
+               (unsigned long)flow_health.lc302_frame_count,
+               (unsigned long)wire_us,
+               (unsigned long)flow_health.lc302_integration_us,
+               flow_health.raw_dy_cm, flow_debug.gyro_disp_y,
+               flow_health.true_dy_body_cm,
+               flow_health.gyro_history_selected_hit,
+               flow_health.gyro_shadow_hit_mask,
+               (unsigned long)flow_health.gyro_history_hit_count,
+               (unsigned long)flow_health.gyro_history_fallback_count,
+               flow_health.gyro_comp_y_shadow_cm[0],
+               flow_health.gyro_comp_y_shadow_cm[1],
+               flow_health.gyro_comp_y_shadow_cm[2],
+               flow_health.gyro_comp_y_shadow_cm[3],
+               flow_health.gyro_comp_y_shadow_cm[4],
+               flow_health.gyro_comp_y_shadow_cm[5],
+               flow_health.true_dy_shadow_cm[0],
+               flow_health.true_dy_shadow_cm[1],
+               flow_health.true_dy_shadow_cm[2],
+               flow_health.true_dy_shadow_cm[3],
+               flow_health.true_dy_shadow_cm[4],
+               flow_health.true_dy_shadow_cm[5]);
     }
 
 #if FLOW_DEBUG_GATE

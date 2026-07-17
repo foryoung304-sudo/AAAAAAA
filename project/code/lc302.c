@@ -1,4 +1,5 @@
 #include "lc302.h"
+#include "imu.h"
 
 lc302_data_t lc302_data;
 
@@ -7,6 +8,7 @@ static uint8_t lc302_payload_index = 0;
 static uint8_t lc302_parse_state = 0;
 static uint8_t lc302_xor_calc = 0;
 static uint8_t lc302_xor_recv = 0;
+static uint32_t lc302_frame_start_rx_us = 0u;
 
 static int16_t lc302_i16_le(uint8_t low, uint8_t high)
 {
@@ -43,6 +45,11 @@ static void lc302_decode_payload(void)
     lc302_data.accum_integration_us += lc302_data.integration_timespan;
     lc302_data.update = 1u;
     lc302_data.frame_count++;
+    /* The optical integration necessarily happened before UART transport.
+     * Keep both packet-edge timestamps: flow compensation anchors to the
+     * first byte, while the final-byte timestamp remains useful for health. */
+    lc302_data.last_frame_start_rx_us = lc302_frame_start_rx_us;
+    lc302_data.last_frame_rx_us = system_time_us();
 }
 
 static void lc302_parse_byte(uint8_t ch)
@@ -54,6 +61,7 @@ static void lc302_parse_byte(uint8_t ch)
         case 0:
             if(ch == LC302_FRAME_HEAD)
             {
+                lc302_frame_start_rx_us = system_time_us();
                 lc302_parse_state = 1;
             }
             break;
@@ -111,6 +119,7 @@ void lc302_init(void)
     lc302_parse_state = 0;
     lc302_xor_calc = 0;
     lc302_xor_recv = 0;
+    lc302_frame_start_rx_us = 0u;
 
     uart_init(LC302_UART, LC302_BAUDRATE, LC302_RX_PIN, LC302_TX_PIN);
     uart_rx_interrupt(LC302_UART, 1);
@@ -133,7 +142,9 @@ void lc302_update(void)
 
 void lc302_get_motion(float *dx, float *dy, uint8_t *valid, uint8_t *quality,
                       uint16_t *count, uint32_t *integration_us,
-                      uint32_t *frame_count)
+                      uint32_t *frame_count,
+                      uint32_t *last_frame_start_rx_us,
+                      uint32_t *last_frame_rx_us)
 {
     float snapshot_dx;
     float snapshot_dy;
@@ -142,6 +153,8 @@ void lc302_get_motion(float *dx, float *dy, uint8_t *valid, uint8_t *quality,
     uint16_t snapshot_count;
     uint32_t snapshot_integration_us;
     uint32_t snapshot_frame_count;
+    uint32_t snapshot_last_frame_start_rx_us;
+    uint32_t snapshot_last_frame_rx_us;
     uint32_t primask = interrupt_global_disable();
 
     snapshot_dx = lc302_data.accum_flow_x;
@@ -149,6 +162,8 @@ void lc302_get_motion(float *dx, float *dy, uint8_t *valid, uint8_t *quality,
     snapshot_count = lc302_data.accum_count;
     snapshot_integration_us = lc302_data.accum_integration_us;
     snapshot_frame_count = lc302_data.frame_count;
+    snapshot_last_frame_start_rx_us = lc302_data.last_frame_start_rx_us;
+    snapshot_last_frame_rx_us = lc302_data.last_frame_rx_us;
     snapshot_valid = (snapshot_count > 0u) ? lc302_data.valid : 0u;
     snapshot_quality = lc302_data.quality;
 
@@ -181,6 +196,11 @@ void lc302_get_motion(float *dx, float *dy, uint8_t *valid, uint8_t *quality,
     if(count != 0) *count = snapshot_count;
     if(integration_us != 0) *integration_us = snapshot_integration_us;
     if(frame_count != 0) *frame_count = snapshot_frame_count;
+    if(last_frame_start_rx_us != 0)
+    {
+        *last_frame_start_rx_us = snapshot_last_frame_start_rx_us;
+    }
+    if(last_frame_rx_us != 0) *last_frame_rx_us = snapshot_last_frame_rx_us;
 }
 
 void lc302_debug_print(void)

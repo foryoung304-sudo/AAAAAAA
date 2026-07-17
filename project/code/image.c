@@ -763,7 +763,7 @@ void nms_angle(float angle_in[],int num,float angle_out[],int kernel)
 void draw_x(image_t *img, int x, int y, int len, uint8_t value)
 {
     for (int i = -len; i <= len; i++)
-    {
+    {  
                 AT_IMAGE(img, clip(x + i, 0, img->width - 1), clip(y + i, 0, img->height - 1)) = value;
                 AT_IMAGE(img, clip(x - i, 0, img->width - 1), clip(y + i, 0, img->height - 1)) = value;
     }

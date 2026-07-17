@@ -2,12 +2,13 @@
 #define __PARAM_H__ 
 
 #include "zf_common_headfile.h"
+#include "fisheye_lut.h"
 
 #define JOYSTICK_MAX_VALUE    2048
 #define MAX_VEL_XYZ            200.0f   //最大xy轴速度(cm/s)
 #define MAX_YAW_RATE            20.0f   //最大yaw轴速度(度/s)
 #define MAX_HEIGHT              150.0f   //最大高度(cm)
-#define MIN_HEIGHT               6.0f   //地面高度(cm)
+#define MIN_HEIGHT               6.0f   //ToF补偿后的实测地面高度(cm)
 
 #define CAMERA_FOCAL_LENGTH_PIXEL     60.0f   //相机焦距(像素) 广角镜头通常在50~80之间
 #define IMAGE_CENTER_X          94.0f   //相机中心X坐标(像素)
@@ -23,11 +24,30 @@
 
 #define AUTO_LAND_TRIGGER_HEIGHT_CM      12.0f
 #define AUTO_LAND_TARGET_HEIGHT_CM       MIN_HEIGHT
-#define AUTO_LAND_DISARM_HEIGHT_CM       9.0f
+/* Keep a margin above MIN_HEIGHT for ToF noise and the final descent
+ * transient; disarm still also requires low vertical speed and the guarded
+ * low-throttle dwell in alt_ctrl. */
+#define AUTO_LAND_DISARM_HEIGHT_CM       8.5f
 #define AUTO_LAND_DISARM_VEL_CM_S        5.0f
 
 #define PREFLIGHT_ERR_IMU                (1u << 0)
 #define PREFLIGHT_ERR_TOF                (1u << 1)
+#define PREFLIGHT_ERR_FLOW_NO_BYTES      (1u << 2)
+#define PREFLIGHT_ERR_FLOW_NO_FRAME      (1u << 3)
+#define PREFLIGHT_ERR_FLOW_QUALITY       (1u << 4)
+#define PREFLIGHT_ERR_FLOW_NOT_READY     (1u << 5)
+
+/* Competition flight always depends on optical-flow position control.  Do
+ * not accept a single lucky frame: require a short continuous healthy window
+ * before arming. */
+#define PREFLIGHT_REQUIRE_FLOW           1u
+#define PREFLIGHT_FLOW_READY_TIME_S      0.30f
+
+/* In-flight faults are debounced separately.  A confirmed fault requests the
+ * existing controlled auto-land path; it must never stop the motors in air. */
+#define FLIGHT_FAILSAFE_IMU_CONFIRM_S    0.10f
+#define FLIGHT_FAILSAFE_TOF_CONFIRM_S    0.30f
+#define FLIGHT_FAILSAFE_FLOW_CONFIRM_S   0.50f
 
 // 限幅宏
 #define LIMIT(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
@@ -215,6 +235,7 @@ extern uint8_t locked_flag;
 extern uint8_t auto_landing_request;
 extern uint8_t auto_landing_active;
 extern volatile uint8_t preflight_error_flags;
+extern volatile uint8_t flight_sensor_failsafe_flags;
 extern manual_input_t manual_input;
 
 extern uint8_t base_image[MT9V03X_H][MT9V03X_W];
@@ -229,6 +250,7 @@ extern image_t decoupled_img;
 extern image_t mapx_img;
 extern image_t mapy_img; 
 
+void fisheye_lut_apply(fisheye_lut_id_t id);
 
 uint8_t preflight_check(void);
 

@@ -7,6 +7,7 @@ imu_data_t imu_data = {
     .gyro_offset = {0.0f, 0.0f, 0.0f},
     .gyro_offset_actual = {0.0f, 0.0f, 0.0f},
     .gyro_actual = {0.0f, 0.0f, 0.0f},
+    .gyro_unfiltered = {0.0f, 0.0f, 0.0f},
     .gyro_raw = {0, 0, 0},
     .acc_offset = {0.0f, 0.0f, 0.0f},
     .acc_actual = {0.0f, 0.0f, 0.0f},
@@ -753,6 +754,9 @@ void imu_calc(void)
     imu_log_gyro_unfiltered[0] = gyro_x;
     imu_log_gyro_unfiltered[1] = gyro_y;
     imu_log_gyro_unfiltered[2] = gyro_z;
+    imu_data.gyro_unfiltered[0] = gyro_x;
+    imu_data.gyro_unfiltered[1] = gyro_y;
+    imu_data.gyro_unfiltered[2] = gyro_z;
     imu_log_acc_unfiltered[0] = acc_x;
     imu_log_acc_unfiltered[1] = acc_y;
     imu_log_acc_unfiltered[2] = acc_z;
@@ -862,6 +866,7 @@ void imu_data_init(void)
         imu_data.acc_offset[i] = 0.0f;
     
         imu_data.gyro_actual[i] = 0.0f;
+        imu_data.gyro_unfiltered[i] = 0.0f;
         imu_data.acc_actual[i] = 0.0f;
  
     }

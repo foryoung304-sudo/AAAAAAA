@@ -22,8 +22,11 @@
 #define FLOW_VALID_LOST_FRAMES 5
 #define FLOW_VALID_RECOVER_FRAMES 2
 #define FLOW_GYRO_COMP_GAIN_X 1.85f
-#define FLOW_GYRO_COMP_GAIN_Y 1.50f
-#define FLOW_RP_USE_ATTITUDE_DELTA 1
+#define FLOW_GYRO_COMP_GAIN_Y 1.20f
+/* LC302 rotation compensation must use the gyro angle accumulated over the
+ * actual sensor-frame interval.  Filtered attitude deltas attenuate/lag fast
+ * roll and pitch motion and leave height-scaled false optical-flow velocity. */
+#define FLOW_RP_USE_ATTITUDE_DELTA 0
 #define FLOW_YAW_REJECT_DPS 150.0f
 #define FLOW_YAW_USE_ATTITUDE_DELTA 1
 #define FLOW_CALIB_RAW_ONLY 0
@@ -56,12 +59,12 @@
 #define FLOW_YAW_VISION_GAIN_X -0.26f
 #define FLOW_YAW_VISION_GAIN_Y 0.45f
 
-#define FLOW_DEBUG_ENABLE 1
+#define FLOW_DEBUG_ENABLE 0
 #define FLOW_DEBUG_DIV 1
-#define FLOW_DEBUG_GATE 1
-#define FLOW_DEBUG_ATTITUDE 1
-#define FLOW_DEBUG_BODY 1
-#define FLOW_DEBUG_EARTH 1
+#define FLOW_DEBUG_GATE 0
+#define FLOW_DEBUG_ATTITUDE 0
+#define FLOW_DEBUG_BODY 0
+#define FLOW_DEBUG_EARTH 0
 #define FLOW_DEBUG_LC302 0
 
 #define FLOW_LITE_VEL_GATE_BASE_CMS 25.0f
@@ -73,6 +76,10 @@
 #define FLOW_LC302_NOMINAL_FRAME_DT_S (1.0f / 48.0f)
 #define FLOW_LC302_MIN_FRAME_DT_S 0.005f
 #define FLOW_LC302_MAX_FRAME_DT_S 0.050f
+/* 64 x 2 ms keeps enough gyro history for an accumulated LC302 frame plus
+ * normal UART/control scheduling jitter. */
+#define FLOW_GYRO_HISTORY_LEN 64u
+#define FLOW_GYRO_SHADOW_COUNT 6u
 #define FLOW_LITE_POS_LIMIT_CM 500.0f
 #define FLOW_LITE_VEL_LIMIT_CMS 350.0f
 
@@ -91,6 +98,12 @@ typedef struct {
   uint16_t lc302_accum_count;
   uint32_t lc302_integration_us;
   uint32_t lc302_frame_count;
+  uint32_t lc302_frame_start_rx_us;
+  uint32_t lc302_frame_rx_us;
+  uint32_t gyro_history_hit_count;
+  uint32_t gyro_history_fallback_count;
+  uint8_t gyro_history_selected_hit;
+  uint8_t gyro_shadow_hit_mask;
   float height_cm;
   float raw_dx_cm;
   float raw_dy_cm;
@@ -108,6 +121,8 @@ typedef struct {
   float innov_vy_cm_s;
   float obs_dt_s;
   float gate_limit_cm_s;
+  float gyro_comp_y_shadow_cm[FLOW_GYRO_SHADOW_COUNT];
+  float true_dy_shadow_cm[FLOW_GYRO_SHADOW_COUNT];
 } flow_health_t;
 
 extern flow_health_t flow_health;

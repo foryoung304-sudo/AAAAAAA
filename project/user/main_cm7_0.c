@@ -133,18 +133,20 @@ int main(void)
 
 
         //uint8_t chip_id = icm42688_get_chip_id();
+        //printf("%d",chip_id);
+        //lc302_update();
         //lc302_debug_print();
         //flow_debug_print();
          //printf("channel_data:%.3f,%.3f,%.3f\r\n", imu_data.pitch, imu_data.roll, imu_data.yaw);
-       /*printf("rpy %.3f %.3f %.3f | e %.5f %.5f %.5f | i %.5f %.5f %.5f | kp %.3f ki %.3f w %.2f gn %.4f\r\n",
+      /* printf("rpy %.3f %.3f %.3f | e %.5f %.5f %.5f | i %.5f %.5f %.5f | kp %.3f ki %.3f w %.2f gn %.4f\r\n",
             imu_data.roll, imu_data.pitch, imu_data.yaw,
             imu_debug_ex, imu_debug_ey, imu_debug_ez,
             imu_debug_ex_int, imu_debug_ey_int, imu_debug_ez_int,
             imu_debug_kp, imu_debug_ki,
             imu_debug_acc_weight,
-            imu_debug_gyro_rad_norm);*/
-            //printf("gyro_actual: %.3f, %.3f, %.3f\r\n", imu_data.gyro_actual[0], imu_data.gyro_actual[1], imu_data.gyro_actual[2]);
-            //printf("acc_actual: %.3f, %.3f, %.3f\r\n", imu_data.acc_actual[0], imu_data.acc_actual[1], imu_data.acc_actual[2]);
+            imu_debug_gyro_rad_norm);
+            printf("gyro_actual: %.3f, %.3f, %.3f\r\n", imu_data.gyro_actual[0], imu_data.gyro_actual[1], imu_data.gyro_actual[2]);
+            printf("acc_actual: %.3f, %.3f, %.3f\r\n", imu_data.acc_actual[0], imu_data.acc_actual[1], imu_data.acc_actual[2]);
            //pid_menu_task();
            /*printf("armed: %d |actual: %.3f, %.3f, %.3f | ct: %.3f, %.3f, %.3f|throttle: %.3f |motor: %d, %d, %d, %d\r\n",
             vehicle_state.armed,

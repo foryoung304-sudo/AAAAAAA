@@ -16,6 +16,11 @@ typedef struct
     flight_mode_t last_flight_mode;
     float target_vel_x_ramped;
     float target_vel_y_ramped;
+    float profile_pos_x;
+    float profile_pos_y;
+    float profile_vel_x;
+    float profile_vel_y;
+    uint8_t profile_valid;
     float target_roll_ramped;
     float target_pitch_ramped;
     float vel_err_x_body_filtered;
@@ -26,6 +31,12 @@ typedef struct
     uint8_t loc_ready_last;
     uint8_t loc_hold_active;
     float loc_hold_stable_time_s;
+    float loc_hold_time_s;
+    float vel_i_yaw_sin;
+    float vel_i_yaw_cos;
+    uint8_t vel_i_yaw_valid;
+    uint8_t vel_pid_saturated_x;
+    uint8_t vel_pid_saturated_y;
 } loc_runtime_t;
 
 static loc_runtime_t loc_rt =
@@ -73,14 +84,10 @@ static uint8_t loc_damping_ready(void)
 
 static float loc_hold_enable_height(void)
 {
-    float enable_height = vehicle_setpoint.target_height - LOC_ENABLE_TARGET_MARGIN_CM;
-
-    if(enable_height < LOC_ENABLE_HEIGHT_CM)
-    {
-        enable_height = LOC_ENABLE_HEIGHT_CM;
-    }
-
-    return enable_height;
+    /* Horizontal authority must not move upward with a higher altitude goal.
+     * Start damping at LOC_ENABLE_HEIGHT_CM, then allow position capture at a
+     * fixed, proven height while the altitude profile continues climbing. */
+    return LOC_HOLD_ENABLE_HEIGHT_CM;
 }
 
 static uint8_t loc_hold_entry_ready(void)
@@ -90,9 +97,10 @@ static uint8_t loc_hold_entry_ready(void)
                             vehicle_state.current_vel_y * vehicle_state.current_vel_y);
 
     return ((loc_damping_ready() != 0u) &&
-            (alt_phase == ALT_PHASE_HOLD) &&
             (vehicle_state.current_height >= enable_height) &&
             (fabsf(vehicle_state.current_vel_z) <= LOC_ENABLE_VZ_MAX_CM_S) &&
+            (fabsf(vehicle_state.current_roll) <= LOC_ENABLE_ATT_MAX_DEG) &&
+            (fabsf(vehicle_state.current_pitch) <= LOC_ENABLE_ATT_MAX_DEG) &&
             (horiz_spd <= LOC_ENABLE_HORIZ_VEL_MAX_CM_S));
 }
 
@@ -107,7 +115,6 @@ static uint8_t loc_hold_should_release(void)
     }
 
     return ((loc_damping_ready() == 0u) ||
-            (alt_phase != ALT_PHASE_HOLD) ||
             (vehicle_state.current_height < release_height));
 }
 
@@ -131,6 +138,9 @@ static void loc_reset_vel_pids(void)
 {
     stan_pid_reset(&loc_ctrl.vel_pid[0]);
     stan_pid_reset(&loc_ctrl.vel_pid[1]);
+    loc_rt.vel_i_yaw_valid = 0u;
+    loc_rt.vel_pid_saturated_x = 0u;
+    loc_rt.vel_pid_saturated_y = 0u;
 }
 
 /*
@@ -143,6 +153,8 @@ static void loc_clear_vel_pid_integrators(void)
 {
     loc_ctrl.vel_pid[0].out_i = 0.0f;
     loc_ctrl.vel_pid[1].out_i = 0.0f;
+    loc_rt.vel_pid_saturated_x = 0u;
+    loc_rt.vel_pid_saturated_y = 0u;
 }
 
 static void loc_reset_pids(void)
@@ -162,12 +174,169 @@ static void loc_reset_runtime_output(void)
     loc_rt.brake_weight = 0.0f;
 }
 
+static void loc_reset_position_profile(float pos_x, float pos_y)
+{
+    loc_rt.profile_pos_x = pos_x;
+    loc_rt.profile_pos_y = pos_y;
+    loc_rt.profile_vel_x = 0.0f;
+    loc_rt.profile_vel_y = 0.0f;
+    loc_rt.profile_valid = 1u;
+    loc_2l_ct.profile_vel_x = 0.0f;
+    loc_2l_ct.profile_vel_y = 0.0f;
+}
+
+/* Vector trapezoidal profile for a dynamically changing earth-frame goal.
+ * The leash keeps the reference reachable after a disturbance. */
+static void loc_update_position_profile(float goal_x,
+                                        float goal_y,
+                                        float dT_s)
+{
+    float tracking_x;
+    float tracking_y;
+    float tracking_distance;
+    float goal_x_from_vehicle;
+    float goal_y_from_vehicle;
+    float goal_distance_from_vehicle;
+    float dx;
+    float dy;
+    float distance;
+    float speed_blend;
+    float profile_speed_limit;
+    float desired_speed;
+    float tracking_scale;
+    float desired_vx;
+    float desired_vy;
+    float dv_x;
+    float dv_y;
+    float dv;
+    float max_dv;
+    float next_x;
+    float next_y;
+
+    if(loc_rt.profile_valid == 0u)
+    {
+        loc_reset_position_profile(vehicle_state.current_pos_x,
+                                   vehicle_state.current_pos_y);
+    }
+
+    tracking_x = loc_rt.profile_pos_x - vehicle_state.current_pos_x;
+    tracking_y = loc_rt.profile_pos_y - vehicle_state.current_pos_y;
+    tracking_distance = sqrtf(tracking_x * tracking_x + tracking_y * tracking_y);
+    goal_x_from_vehicle = goal_x - vehicle_state.current_pos_x;
+    goal_y_from_vehicle = goal_y - vehicle_state.current_pos_y;
+    goal_distance_from_vehicle = sqrtf(goal_x_from_vehicle * goal_x_from_vehicle +
+                                       goal_y_from_vehicle * goal_y_from_vehicle);
+
+    if((tracking_distance > LOC_PROFILE_LEASH_START_CM) &&
+       (goal_distance_from_vehicle > 0.05f))
+    {
+        float reference_distance = LIMIT(tracking_distance,
+                                         0.0f,
+                                         LOC_PROFILE_LEASH_MAX_CM);
+        float goal_unit_x = goal_x_from_vehicle / goal_distance_from_vehicle;
+        float goal_unit_y = goal_y_from_vehicle / goal_distance_from_vehicle;
+        float along_goal_velocity;
+
+        if(reference_distance > goal_distance_from_vehicle)
+        {
+            reference_distance = goal_distance_from_vehicle;
+        }
+
+        loc_rt.profile_pos_x = vehicle_state.current_pos_x +
+                               goal_unit_x * reference_distance;
+        loc_rt.profile_pos_y = vehicle_state.current_pos_y +
+                               goal_unit_y * reference_distance;
+        along_goal_velocity = loc_rt.profile_vel_x * goal_unit_x +
+                              loc_rt.profile_vel_y * goal_unit_y;
+        if(along_goal_velocity < 0.0f)
+        {
+            along_goal_velocity = 0.0f;
+        }
+        loc_rt.profile_vel_x = along_goal_velocity * goal_unit_x;
+        loc_rt.profile_vel_y = along_goal_velocity * goal_unit_y;
+        tracking_distance = reference_distance;
+    }
+    else if(goal_distance_from_vehicle <= 0.05f)
+    {
+        loc_rt.profile_pos_x = goal_x;
+        loc_rt.profile_pos_y = goal_y;
+        loc_rt.profile_vel_x = 0.0f;
+        loc_rt.profile_vel_y = 0.0f;
+        tracking_distance = 0.0f;
+    }
+
+    dx = goal_x - loc_rt.profile_pos_x;
+    dy = goal_y - loc_rt.profile_pos_y;
+    distance = sqrtf(dx * dx + dy * dy);
+    if(distance <= 0.05f)
+    {
+        loc_rt.profile_pos_x = goal_x;
+        loc_rt.profile_pos_y = goal_y;
+        loc_rt.profile_vel_x = 0.0f;
+        loc_rt.profile_vel_y = 0.0f;
+        loc_2l_ct.profile_vel_x = 0.0f;
+        loc_2l_ct.profile_vel_y = 0.0f;
+        return;
+    }
+
+    speed_blend = ctrl_smoothstep01(
+        (distance - LOC_PROFILE_BLEND_START_CM) /
+        (LOC_PROFILE_BLEND_END_CM - LOC_PROFILE_BLEND_START_CM));
+    profile_speed_limit = LOC_PROFILE_NEAR_SPEED_CM_S +
+        (LOC_PROFILE_FAR_SPEED_CM_S - LOC_PROFILE_NEAR_SPEED_CM_S) * speed_blend;
+    desired_speed = LIMIT(sqrtf(2.0f * LOC_TRAJ_ACCEL_CM_S2 * distance),
+                          0.0f,
+                          profile_speed_limit);
+    tracking_scale = 1.0f - ctrl_smoothstep01(
+        (tracking_distance - LOC_PROFILE_LEASH_START_CM) /
+        (LOC_PROFILE_LEASH_MAX_CM - LOC_PROFILE_LEASH_START_CM));
+    desired_speed *= tracking_scale;
+    desired_vx = desired_speed * dx / distance;
+    desired_vy = desired_speed * dy / distance;
+
+    dv_x = desired_vx - loc_rt.profile_vel_x;
+    dv_y = desired_vy - loc_rt.profile_vel_y;
+    dv = sqrtf(dv_x * dv_x + dv_y * dv_y);
+    max_dv = LOC_TRAJ_ACCEL_CM_S2 * dT_s;
+    if((dv > max_dv) && (dv > 0.0001f))
+    {
+        dv_x *= max_dv / dv;
+        dv_y *= max_dv / dv;
+    }
+
+    loc_rt.profile_vel_x += dv_x;
+    loc_rt.profile_vel_y += dv_y;
+    next_x = loc_rt.profile_pos_x + loc_rt.profile_vel_x * dT_s;
+    next_y = loc_rt.profile_pos_y + loc_rt.profile_vel_y * dT_s;
+    if((dx * (goal_x - next_x) + dy * (goal_y - next_y)) <= 0.0f)
+    {
+        loc_rt.profile_pos_x = goal_x;
+        loc_rt.profile_pos_y = goal_y;
+        loc_rt.profile_vel_x = 0.0f;
+        loc_rt.profile_vel_y = 0.0f;
+    }
+    else
+    {
+        loc_rt.profile_pos_x = next_x;
+        loc_rt.profile_pos_y = next_y;
+    }
+
+    loc_2l_ct.profile_vel_x = loc_rt.profile_vel_x;
+    loc_2l_ct.profile_vel_y = loc_rt.profile_vel_y;
+}
+
 static void loc_reset_vel_debug(void)
 {
     loc_1l_ct.vel_err_x_body = 0.0f;
     loc_1l_ct.vel_err_y_body = 0.0f;
     loc_1l_ct.raw_target_roll = 0.0f;
     loc_1l_ct.raw_target_pitch = 0.0f;
+    loc_1l_ct.dynamic_target_roll = 0.0f;
+    loc_1l_ct.dynamic_target_pitch = 0.0f;
+    loc_1l_ct.target_accel_x_body = 0.0f;
+    loc_1l_ct.target_accel_y_body = 0.0f;
+    loc_1l_ct.horizontal_bias_roll = 0.0f;
+    loc_1l_ct.horizontal_bias_pitch = 0.0f;
     loc_1l_ct.loc_weight = loc_rt.loc_weight;
     loc_1l_ct.loc_ready = 0u;
     loc_1l_ct.loc_hold_ready = 0u;
@@ -203,6 +372,7 @@ static void loc_hold_current_without_output(uint8_t clear_attitude_setpoint)
     loc_rt.brake_weight = 0.0f;
     loc_rt.loc_hold_active = 0u;
     loc_rt.loc_hold_stable_time_s = 0.0f;
+    loc_rt.loc_hold_time_s = 0.0f;
     loc_reset_runtime_output();
     loc_reset_pids();
     loc_reset_vel_debug();
@@ -283,6 +453,49 @@ static void loc_earth_vel_err_to_body(float err_x_earth,
     *err_x_body =  err_x_earth * vehicle_state.yaw_cos + err_y_earth * vehicle_state.yaw_sin;
     *err_y_body = -err_x_earth * vehicle_state.yaw_sin + err_y_earth * vehicle_state.yaw_cos;
 }
+
+static float loc_accel_to_angle_deg(float accel_cm_s2)
+{
+    return atan2f(accel_cm_s2, LOC_GRAVITY_CM_S2) * 57.2957795f;
+}
+
+/*
+ * The velocity PID integrators are body-axis components because their inputs
+ * are body-axis velocity errors.  Preserve the represented earth-frame
+ * correction when yaw changes by rotating the stored vector into the new body
+ * frame.  Without this, an old body-X/Y integral silently changes its physical
+ * direction as the aircraft yaws.
+ */
+static void loc_rotate_vel_integrators_with_yaw(void)
+{
+    const float yaw_sin = vehicle_state.yaw_sin;
+    const float yaw_cos = vehicle_state.yaw_cos;
+
+    if(loc_rt.vel_i_yaw_valid == 0u)
+    {
+        loc_rt.vel_i_yaw_sin = yaw_sin;
+        loc_rt.vel_i_yaw_cos = yaw_cos;
+        loc_rt.vel_i_yaw_valid = 1u;
+        return;
+    }
+
+    /* delta = yaw_now - yaw_previous; this also handles +/-180 deg wrap. */
+    const float delta_cos =
+        yaw_cos * loc_rt.vel_i_yaw_cos + yaw_sin * loc_rt.vel_i_yaw_sin;
+    const float delta_sin =
+        yaw_sin * loc_rt.vel_i_yaw_cos - yaw_cos * loc_rt.vel_i_yaw_sin;
+    const float old_i_x = loc_ctrl.vel_pid[0].out_i;
+    const float old_i_y = loc_ctrl.vel_pid[1].out_i;
+
+    loc_ctrl.vel_pid[0].out_i = delta_cos * old_i_x + delta_sin * old_i_y;
+    loc_ctrl.vel_pid[1].out_i = -delta_sin * old_i_x + delta_cos * old_i_y;
+
+    loc_rt.vel_i_yaw_sin = yaw_sin;
+    loc_rt.vel_i_yaw_cos = yaw_cos;
+}
+
+/* Learn only in a calm, valid hold.  Capture/braking velocity errors are
+ * transients, not stationary CG/tether bias, so they must never enter trim. */
 // ============================================================================
 // Public interface
 // ============================================================================
@@ -296,7 +509,7 @@ void loc_ctrl_init(void)
         .ki = 0.0f,
         .kd = 0.0f,
         .i_max = 0.0f,
-        .p_max = 5.0f,
+        .p_max = LOC_POS_CORRECTION_LIMIT_CM_S,
         .d_max = 0.0f,
         .low_pass = 0.1f
     };
@@ -306,29 +519,30 @@ void loc_ctrl_init(void)
         .ki = 0.0f,
         .kd = 0.0f,
         .i_max = 0.0f,
-        .p_max = 5.0f,
+        .p_max = LOC_POS_CORRECTION_LIMIT_CM_S,
         .d_max = 0.0f,
         .low_pass = 0.1f
     };
     
-    // 速度环PID参数（内环）
+    /* Velocity PID output is horizontal acceleration (cm/s^2), not angle.
+     * The acceleration command is converted to lean angle explicitly below. */
     loc_ctrl.vel_pid[0] = (pid_param_t){     // Vx方向
         .kp = 2.0f,
-        .ki = 0.5f,
-        .kd = 0.5f,
+        .ki = 1.0f,
+        .kd = 0.03f,
         .i_max = 20.0f,
-        .p_max = MAX_VEL_CT_VAL,
-        .d_max = 10.0f,
+        .p_max = LOC_MAX_HORIZONTAL_ACCEL_CM_S2,
+        .d_max = 30.0f,
         .low_pass = 0.2f
     };
     
     loc_ctrl.vel_pid[1] = (pid_param_t){     // Vy方向
         .kp = 2.0f,
-        .ki = 0.5f,
-        .kd = 0.5f,
+        .ki = 1.0f,
+        .kd = 0.03f,
         .i_max = 20.0f,
-        .p_max = MAX_VEL_CT_VAL,
-        .d_max = 10.0f,
+        .p_max = LOC_MAX_HORIZONTAL_ACCEL_CM_S2,
+        .d_max = 30.0f,
         .low_pass = 0.2f
     };
 
@@ -360,8 +574,6 @@ void loc_2level_ctrl(float dT_s)
             return;
         }
 
-        loc_2l_ct.exp_pos_x = vehicle_setpoint.target_pos_x;
-        loc_2l_ct.exp_pos_y = vehicle_setpoint.target_pos_y;
         loc_2l_ct.fb_pos_x = vehicle_state.current_pos_x;
         loc_2l_ct.fb_pos_y = vehicle_state.current_pos_y;
 
@@ -378,12 +590,11 @@ void loc_2level_ctrl(float dT_s)
             loc_2l_ct.exp_vel_y = 0.0f;
             loc_rt.target_vel_x_ramped = 0.0f;
             loc_rt.target_vel_y_ramped = 0.0f;
+            loc_reset_position_profile(vehicle_state.current_pos_x,
+                                       vehicle_state.current_pos_y);
             loc_reset_pos_pids();
             return;
         }
-
-        float final_err_x=loc_2l_ct.exp_pos_x-loc_2l_ct.fb_pos_x;
-        float final_err_y=loc_2l_ct.exp_pos_y-loc_2l_ct.fb_pos_y;
 
         if(loc_brake_phase_active() != 0u)
         {
@@ -396,14 +607,38 @@ void loc_2level_ctrl(float dT_s)
             return;
         }
 
-        loc_2l_ct.exp_vel_x = stan_pid_solve(&loc_ctrl.pos_pid[0], final_err_x, dT_s, 0);
-        loc_2l_ct.exp_vel_y = stan_pid_solve(&loc_ctrl.pos_pid[1], final_err_y, dT_s, 0);
+        float goal_err_x = vehicle_setpoint.target_pos_x - loc_2l_ct.fb_pos_x;
+        float goal_err_y = vehicle_setpoint.target_pos_y - loc_2l_ct.fb_pos_y;
 
-        loc_2l_ct.exp_vel_x=ctrl_terminal_clamp(final_err_x,loc_2l_ct.exp_vel_x);
-        loc_2l_ct.exp_vel_y=ctrl_terminal_clamp(final_err_y,loc_2l_ct.exp_vel_y);
+        loc_update_position_profile(vehicle_setpoint.target_pos_x,
+                                    vehicle_setpoint.target_pos_y,
+                                    dT_s);
+        loc_2l_ct.exp_pos_x = vehicle_setpoint.target_pos_x;
+        loc_2l_ct.exp_pos_y = vehicle_setpoint.target_pos_y;
 
-        float brake_speed_x = ctrl_brake_speed(LOC_TRAJ_ACCEL_CM_S2, final_err_x);
-        float brake_speed_y = ctrl_brake_speed(LOC_TRAJ_ACCEL_CM_S2, final_err_y);
+        /* The profile is feed-forward only.  Position feedback must always
+         * close on the final hold point; otherwise a leashed profile can move
+         * with a drifting aircraft and hide the error that should bring it
+         * home. */
+        /* A trajectory feed-forward may briefly point away from the final
+         * goal after its internal reference overshoots.  It must never cancel
+         * the position feedback that is trying to return to the competition
+         * target.  Keep aligned feed-forward, reject only the opposing part. */
+        float profile_ff_x = ctrl_terminal_clamp(goal_err_x,
+                                                  loc_rt.profile_vel_x);
+        float profile_ff_y = ctrl_terminal_clamp(goal_err_y,
+                                                  loc_rt.profile_vel_y);
+
+        loc_2l_ct.exp_vel_x = profile_ff_x +
+            stan_pid_solve(&loc_ctrl.pos_pid[0], goal_err_x, dT_s, 0);
+        loc_2l_ct.exp_vel_y = profile_ff_y +
+            stan_pid_solve(&loc_ctrl.pos_pid[1], goal_err_y, dT_s, 0);
+
+        loc_2l_ct.exp_vel_x=ctrl_terminal_clamp(goal_err_x,loc_2l_ct.exp_vel_x);
+        loc_2l_ct.exp_vel_y=ctrl_terminal_clamp(goal_err_y,loc_2l_ct.exp_vel_y);
+
+        float brake_speed_x = ctrl_brake_speed(LOC_TRAJ_ACCEL_CM_S2, goal_err_x);
+        float brake_speed_y = ctrl_brake_speed(LOC_TRAJ_ACCEL_CM_S2, goal_err_y);
 
             loc_2l_ct.exp_vel_x = LIMIT(loc_2l_ct.exp_vel_x,
                                         -brake_speed_x,
@@ -413,8 +648,19 @@ void loc_2level_ctrl(float dT_s)
                                         -brake_speed_y,
                                         brake_speed_y);
 
-        float target_vel_x = LIMIT(loc_2l_ct.exp_vel_x, -MAX_HORIZONTAL_SPEED, MAX_HORIZONTAL_SPEED);
-        float target_vel_y = LIMIT(loc_2l_ct.exp_vel_y, -MAX_HORIZONTAL_SPEED, MAX_HORIZONTAL_SPEED);
+        float target_vel_x = loc_2l_ct.exp_vel_x;
+        float target_vel_y = loc_2l_ct.exp_vel_y;
+        float target_speed = sqrtf(target_vel_x * target_vel_x +
+                                   target_vel_y * target_vel_y);
+
+        /* The competition limit is a horizontal vector speed, not a per-axis
+         * limit; preserve direction when the profile and correction sum is
+         * larger than the available cruise speed. */
+        if(target_speed > LOC_TOTAL_VEL_LIMIT_CM_S)
+        {
+            target_vel_x *= LOC_TOTAL_VEL_LIMIT_CM_S / target_speed;
+            target_vel_y *= LOC_TOTAL_VEL_LIMIT_CM_S / target_speed;
+        }
 
             loc_rt.target_vel_x_ramped =
                 ctrl_slew_limit(loc_rt.target_vel_x_ramped,
@@ -452,6 +698,7 @@ void loc_1level_ctrl(float dT_s)
             vehicle_setpoint.target_pitch = 0.0f;
         }
         loc_reset_vel_debug();
+        loc_rt.vel_i_yaw_valid = 0u;
         return; // 未解锁不输出
     }
 
@@ -478,7 +725,7 @@ void loc_1level_ctrl(float dT_s)
         float vel_err_x_body;
         float vel_err_y_body;
 
-
+        loc_rotate_vel_integrators_with_yaw();
         loc_earth_vel_err_to_body(vel_err_x_earth,
                                   vel_err_y_earth,
                                   &vel_err_x_body,
@@ -531,13 +778,46 @@ void loc_1level_ctrl(float dT_s)
         loc_1l_ct.vel_err_y_body = vel_err_y_body;
 
      
-        vehicle_setpoint.target_pitch = -stan_pid_solve(&loc_ctrl.vel_pid[0], vel_err_x_body, dT_s, 0);
-        vehicle_setpoint.target_roll  =  stan_pid_solve(&loc_ctrl.vel_pid[1], vel_err_y_body, dT_s, 0);
+        loc_1l_ct.target_accel_x_body =
+            stan_pid_solve(&loc_ctrl.vel_pid[0],
+                           vel_err_x_body,
+                           dT_s,
+                           loc_rt.vel_pid_saturated_x);
+        loc_1l_ct.target_accel_y_body =
+            stan_pid_solve(&loc_ctrl.vel_pid[1],
+                           vel_err_y_body,
+                           dT_s,
+                           loc_rt.vel_pid_saturated_y);
+
+        /* +body-X acceleration requires negative pitch; +body-Y requires
+         * positive roll for this airframe's established attitude signs. */
+        loc_1l_ct.dynamic_target_pitch =
+            -loc_accel_to_angle_deg(loc_1l_ct.target_accel_x_body);
+        loc_1l_ct.dynamic_target_roll =
+             loc_accel_to_angle_deg(loc_1l_ct.target_accel_y_body);
+
+        loc_1l_ct.horizontal_bias_roll = 0.0f;
+        loc_1l_ct.horizontal_bias_pitch = 0.0f;
+
+        vehicle_setpoint.target_pitch = loc_1l_ct.dynamic_target_pitch;
+        vehicle_setpoint.target_roll = loc_1l_ct.dynamic_target_roll;
         float angle_limit = LOC_MAX_OUTPUT_ANGLE_DEG;
         if(loc_hold_ready() == 0u)
         {
             angle_limit = loc_damping_angle_limit();
         }
+
+        /* Feed the real downstream authority limit back to the velocity PID.
+         * stan_pid_solve() then freezes only integration that would push
+         * farther into saturation, while opposite-sign error can unwind I. */
+        loc_rt.vel_pid_saturated_x =
+            ((fabsf(vehicle_setpoint.target_pitch) >= (angle_limit - 0.01f)) ||
+             (fabsf(loc_1l_ct.target_accel_x_body) >=
+              (LOC_MAX_HORIZONTAL_ACCEL_CM_S2 - 0.5f))) ? 1u : 0u;
+        loc_rt.vel_pid_saturated_y =
+            ((fabsf(vehicle_setpoint.target_roll) >= (angle_limit - 0.01f)) ||
+             (fabsf(loc_1l_ct.target_accel_y_body) >=
+              (LOC_MAX_HORIZONTAL_ACCEL_CM_S2 - 0.5f))) ? 1u : 0u;
 
         vehicle_setpoint.target_roll = LIMIT(vehicle_setpoint.target_roll,
                                              -angle_limit,
@@ -603,6 +883,7 @@ void loc_ctrl_update(float dT_s)
         loc_rt.loc_ready_time_s = 0.0f;
         loc_rt.brake_weight = 0.0f;
         loc_rt.loc_hold_active = 0u;
+        loc_rt.loc_hold_time_s = 0.0f;
     }
     else
     {
@@ -618,6 +899,7 @@ void loc_ctrl_update(float dT_s)
             loc_rt.brake_weight = 0.0f;
             loc_rt.loc_hold_active = 0u;
             loc_rt.loc_hold_stable_time_s = 0.0f;
+            loc_rt.loc_hold_time_s = 0.0f;
         }
 
         if(loc_rt.loc_hold_active != 0u)
@@ -626,6 +908,11 @@ void loc_ctrl_update(float dT_s)
             {
                 loc_rt.loc_hold_active = 0u;
                 loc_rt.loc_hold_stable_time_s = 0.0f;
+                loc_rt.loc_hold_time_s = 0.0f;
+            }
+            else
+            {
+                loc_rt.loc_hold_time_s += dT_s;
             }
         }
         else
@@ -640,6 +927,8 @@ void loc_ctrl_update(float dT_s)
                     vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
                     loc_2l_ct.exp_pos_x = vehicle_state.current_pos_x;
                     loc_2l_ct.exp_pos_y = vehicle_state.current_pos_y;
+                    loc_reset_position_profile(vehicle_state.current_pos_x,
+                                               vehicle_state.current_pos_y);
                     loc_reset_pos_pids();
                     // Remove braking I bias without erasing derivative
                     // history; a full reset would create a D transient at
@@ -647,6 +936,7 @@ void loc_ctrl_update(float dT_s)
                     loc_clear_vel_pid_integrators();
                     loc_rt.loc_hold_active = 1u;
                     loc_rt.loc_hold_stable_time_s = 0.0f;
+                    loc_rt.loc_hold_time_s = 0.0f;
                 }
             }
             else

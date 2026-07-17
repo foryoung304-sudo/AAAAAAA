@@ -8,7 +8,16 @@
 #define MAX_POS_CT_VAL         30.0f      // 最大位置控制输出 (即最大倾斜角度)
 #define LOC_MAX_OUTPUT_ANGLE_DEG   8.0f
 #define MAX_VEL_CT_VAL        50.0f
-
+#define LOC_GRAVITY_CM_S2          980.665f
+#define LOC_MAX_HORIZONTAL_ACCEL_CM_S2  138.0f
+#define LOC_POS_CORRECTION_LIMIT_CM_S 10.0f
+#define LOC_PROFILE_NEAR_SPEED_CM_S    7.0f
+#define LOC_PROFILE_FAR_SPEED_CM_S    15.0f
+#define LOC_PROFILE_BLEND_START_CM    20.0f
+#define LOC_PROFILE_BLEND_END_CM      80.0f
+#define LOC_TOTAL_VEL_LIMIT_CM_S      15.0f
+#define LOC_PROFILE_LEASH_START_CM    12.0f
+#define LOC_PROFILE_LEASH_MAX_CM      40.0f
 #define LOC_TARGET_VEL_SLEW_CM_S2  30.0f
 #define LOC_TRAJ_ACCEL_CM_S2       30.0f
 #define LOC_TARGET_ANGEL_SLEW_DEG_S2  40.0f
@@ -20,9 +29,10 @@
 #define LOC_HOLD_ERR_RELAX_CM 8.0f
 #define LOC_HOLD_ERR_ACTIVE_CM 18.0f
 #define LOC_ENABLE_HEIGHT_CM       50.0f
-#define LOC_ENABLE_TARGET_MARGIN_CM 5.0f
-#define LOC_ENABLE_VZ_MAX_CM_S     4.0f
+#define LOC_HOLD_ENABLE_HEIGHT_CM  65.0f
+#define LOC_ENABLE_VZ_MAX_CM_S    12.0f
 #define LOC_ENABLE_HORIZ_VEL_MAX_CM_S  8.0f  /* hold 进入时最大横向合速度 */
+#define LOC_ENABLE_ATT_MAX_DEG     8.0f
 #define LOC_HOLD_RELEASE_MARGIN_CM 8.0f
 #define LOC_DAMPING_MAX_OUTPUT_ANGLE_DEG 5.0f
 #define LOC_DAMPING_MIN_OUTPUT_ANGLE_DEG 2.0f
@@ -54,6 +64,8 @@ typedef struct {
     float fb_pos_y;
     float exp_vel_x;
     float exp_vel_y;
+    float profile_vel_x;
+    float profile_vel_y;
 } loc_2l_ct_t;
 extern loc_2l_ct_t loc_2l_ct;
 
@@ -67,6 +79,12 @@ typedef struct {
     float vel_err_y_body;
     float raw_target_roll;
     float raw_target_pitch;
+    float dynamic_target_roll;
+    float dynamic_target_pitch;
+    float target_accel_x_body;
+    float target_accel_y_body;
+    float horizontal_bias_roll;
+    float horizontal_bias_pitch;
     float loc_weight;
     uint8_t loc_ready;
     uint8_t loc_hold_ready;

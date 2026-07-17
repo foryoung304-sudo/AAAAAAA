@@ -1,4 +1,5 @@
 #include "zf_common_headfile.h"
+#include "loc_ctrl.h"
 
 
 
@@ -7,12 +8,20 @@ attitude_control_t att_ctrl = {0};
 ct_val_t ct_val = {0};
 att_2l_ct_t att_2l_ct = {0};
 att_1l_ct_t att_1l_ct = {0};
+float att_voltage_output_scale = 1.0f;
 
 #define ATT_I_FREEZE_DUTY      3800
 #define ATT_I_FREEZE_THROTTLE  (((float)(ATT_I_FREEZE_DUTY - MOTOR_DUTY_MIN_START) / (float)(MOTOR_DUTY_MAX - MOTOR_DUTY_MIN_START)) * MAX_CT_VAL + MOTOR_OUTPUT_DEADZONE)
-#define ATT_SP_RATE_FF_GAIN       0.00f
+#define ATT_SP_RATE_FF_GAIN       0.35f
 #define ATT_SP_RATE_FF_LIMIT_DPS  8.0f
 #define ATT_SP_RATE_FF_ALPHA      0.35f
+#define ATT_LARGE_ERR_START_DEG       0.50f
+#define ATT_LARGE_ERR_BLEND_DEG       0.50f
+#define ATT_LARGE_ERR_RATE_GAIN       1.75f
+#define ATT_LARGE_ERR_RATE_LIMIT_DPS  3.00f
+#define ATT_VOLTAGE_REF_V              10.20f
+#define ATT_VOLTAGE_SCALE_MIN           0.90f
+#define ATT_VOLTAGE_SCALE_MAX           1.08f
 
 static float att_prev_target_roll = 0.0f;
 static float att_prev_target_pitch = 0.0f;
@@ -43,6 +52,63 @@ static float att_update_sp_rate_ff(float target,
     *prev_target = target;
 
     return *filtered_rate;
+}
+
+/* Increase attitude recovery only after a meaningful tracking error exists.
+ * The zero-boost region preserves the current small-error/high-frequency
+ * behaviour, while the independent limit keeps a large LOC request bounded. */
+static float att_large_error_rate_boost(float angle_error_deg)
+{
+    float boost = 0.0f;
+    float excess = 0.0f;
+    float blend = 1.0f;
+    float t = 0.0f;
+
+    if(angle_error_deg > ATT_LARGE_ERR_START_DEG)
+    {
+        excess = angle_error_deg - ATT_LARGE_ERR_START_DEG;
+        if(excess < ATT_LARGE_ERR_BLEND_DEG)
+        {
+            t = excess / ATT_LARGE_ERR_BLEND_DEG;
+            blend = t * t * (3.0f - 2.0f * t);
+        }
+        boost = excess * ATT_LARGE_ERR_RATE_GAIN * blend;
+    }
+    else if(angle_error_deg < -ATT_LARGE_ERR_START_DEG)
+    {
+        excess = -angle_error_deg - ATT_LARGE_ERR_START_DEG;
+        if(excess < ATT_LARGE_ERR_BLEND_DEG)
+        {
+            t = excess / ATT_LARGE_ERR_BLEND_DEG;
+            blend = t * t * (3.0f - 2.0f * t);
+        }
+        boost = -excess * ATT_LARGE_ERR_RATE_GAIN * blend;
+    }
+
+    return LIMIT(boost,
+                 -ATT_LARGE_ERR_RATE_LIMIT_DPS,
+                  ATT_LARGE_ERR_RATE_LIMIT_DPS);
+}
+
+static float att_get_voltage_output_scale(void)
+{
+    float voltage = vehicle_state.battery_voltage_filtered;
+    float voltage_ratio;
+
+    if(voltage <= 1.0f)
+    {
+        return 1.0f;
+    }
+
+    voltage_ratio = ATT_VOLTAGE_REF_V / voltage;
+
+    /* A 1.5-power model is the controlled midpoint between the proven-safe
+     * linear compensation and the overly aggressive square model.  It trims
+     * full-battery rate-loop authority without giving up as much large-error
+     * recovery authority as ratio^2. */
+    return LIMIT(voltage_ratio * sqrtf(voltage_ratio),
+                 ATT_VOLTAGE_SCALE_MIN,
+                 ATT_VOLTAGE_SCALE_MAX);
 }
 
 static uint8_t att_rate_i_enabled(void)
@@ -155,7 +221,7 @@ void att_2level_ctrl( float dT_s)
 {
 
      // 未起飞或锁定时复位
-    if(vehicle_state.armed==0) 
+    if(vehicle_state.armed==0)
     {
         att_2l_ct.exp_rol = 0;
         att_2l_ct.exp_pit = 0;
@@ -193,18 +259,36 @@ void att_2level_ctrl( float dT_s)
     att_2l_ct.exp_rol = LIMIT(att_2l_ct.exp_rol, -MAX_ANGLE, MAX_ANGLE);
     att_2l_ct.exp_pit = LIMIT(att_2l_ct.exp_pit, -MAX_ANGLE, MAX_ANGLE);
 
-    float roll_sp_rate_ff = att_update_sp_rate_ff(att_2l_ct.exp_rol,
+    float roll_sp_rate_ff = 0.0f;
+    float pitch_sp_rate_ff = 0.0f;
+
+    /* Location control produces a slew-limited attitude trajectory.  Give
+     * that trajectory a modest lead without changing manual attitude feel. */
+    if(loc_1l_ct.loc_ready != 0u)
+    {
+        roll_sp_rate_ff = att_update_sp_rate_ff(att_2l_ct.exp_rol,
                                                   &att_prev_target_roll,
                                                   &att_roll_sp_rate_ff,
                                                   dT_s);
-    float pitch_sp_rate_ff = att_update_sp_rate_ff(att_2l_ct.exp_pit,
+        pitch_sp_rate_ff = att_update_sp_rate_ff(att_2l_ct.exp_pit,
                                                    &att_prev_target_pitch,
                                                    &att_pitch_sp_rate_ff,
                                                    dT_s);
-    if(att_sp_rate_ff_ready == 0u)
-    {
-        att_sp_rate_ff_ready = 1u;
+        if(att_sp_rate_ff_ready == 0u)
+        {
+            att_sp_rate_ff_ready = 1u;
+        }
     }
+    else
+    {
+        att_prev_target_roll = att_2l_ct.exp_rol;
+        att_prev_target_pitch = att_2l_ct.exp_pit;
+        att_roll_sp_rate_ff = 0.0f;
+        att_pitch_sp_rate_ff = 0.0f;
+        att_sp_rate_ff_ready = 0u;
+    }
+    att_1l_ct.sp_rate_ff[0] = ATT_SP_RATE_FF_GAIN * roll_sp_rate_ff;
+    att_1l_ct.sp_rate_ff[1] = ATT_SP_RATE_FF_GAIN * pitch_sp_rate_ff;
     
     // YAW处理
     float set_yaw_av_tmp = vehicle_setpoint.target_yaw_rate;
@@ -236,18 +320,29 @@ void att_2level_ctrl( float dT_s)
 
     
     // 外环PID计算
+    float roll_angle_error = att_2l_ct.exp_rol - att_2l_ct.fb_rol;
+    float pitch_angle_error = att_2l_ct.exp_pit - att_2l_ct.fb_pit;
+    float roll_large_error_boost = 0.0f;
+    float pitch_large_error_boost = 0.0f;
 
-    
+    /* Only LOC gets the large-error recovery boost.  Manual attitude feel and
+     * the Flash-loaded PID parameters remain unchanged. */
+    if(loc_1l_ct.loc_ready != 0u)
+    {
+        roll_large_error_boost = att_large_error_rate_boost(roll_angle_error);
+        pitch_large_error_boost = att_large_error_rate_boost(pitch_angle_error);
+    }
+
     att_1l_ct.exp_ang_vel[0] =
         stan_pid_solve(&att_ctrl.angle_pid[0],
-                       att_2l_ct.exp_rol - att_2l_ct.fb_rol,
+                       roll_angle_error,
                        dT_s,
-                       0) + ATT_SP_RATE_FF_GAIN * roll_sp_rate_ff;
+                       0) + att_1l_ct.sp_rate_ff[0] + roll_large_error_boost;
     att_1l_ct.exp_ang_vel[1] =
         stan_pid_solve(&att_ctrl.angle_pid[1],
-                       att_2l_ct.exp_pit - att_2l_ct.fb_pit,
+                       pitch_angle_error,
                        dT_s,
-                       0) + ATT_SP_RATE_FF_GAIN * pitch_sp_rate_ff;
+                       0) + att_1l_ct.sp_rate_ff[1] + pitch_large_error_boost;
     att_1l_ct.exp_ang_vel[2] = stan_pid_solve(&att_ctrl.angle_pid[2], att_2l_ct.yaw_err, dT_s, 0);
     
     // 限幅
@@ -264,6 +359,7 @@ void att_1level_ctrl(float dT_s)
         ct_val.rol = 0;
         ct_val.pit = 0;
         ct_val.yaw = 0;
+        att_voltage_output_scale = 1.0f;
         att_1l_ct.fb_ang_vel[0] = imu_data.gyro_actual[0];
         att_1l_ct.fb_ang_vel[1] = imu_data.gyro_actual[1];
         att_1l_ct.fb_ang_vel[2] = imu_data.gyro_actual[2];
@@ -286,6 +382,15 @@ void att_1level_ctrl(float dT_s)
     ct_val.pit = att_rate_pid_solve(&att_ctrl.rate_pid[1],att_1l_ct.exp_ang_vel[1] - att_1l_ct.fb_ang_vel[1],dT_s, enable_rate_i, MAX_ATT1_VAL);
 
     ct_val.yaw = att_rate_pid_solve(&att_ctrl.rate_pid[2],att_1l_ct.exp_ang_vel[2] - att_1l_ct.fb_ang_vel[2],dT_s, enable_rate_i, MAX_YAW_CT_VAL);
+
+    /* Normalize actuator authority to the voltage at which the current Flash
+     * PID set was validated.  Hover throttle already adapts the base thrust,
+     * so the local differential-control gain is compensated linearly, not
+     * quadratically. */
+    att_voltage_output_scale = att_get_voltage_output_scale();
+    ct_val.rol *= att_voltage_output_scale;
+    ct_val.pit *= att_voltage_output_scale;
+    ct_val.yaw *= att_voltage_output_scale;
     // 输出限幅
     ct_val.rol =LIMIT(ct_val.rol, -MAX_ATT1_VAL, MAX_ATT1_VAL);
     ct_val.pit =  LIMIT(ct_val.pit, -MAX_ATT1_VAL, MAX_ATT1_VAL);

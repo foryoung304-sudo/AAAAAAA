@@ -43,7 +43,9 @@ static const char *save_status = "DFLT";
 #define PID_MENU_STEP_NUM   ((uint8_t)(sizeof(step_list) / sizeof(step_list[0])))
 #define PID_FLASH_PAGE      (95u)
 #define PID_FLASH_MAGIC     (0x50494431u)
-#define PID_FLASH_VERSION   (1u)
+#define PID_FLASH_VERSION   (3u)
+#define PID_FLASH_VERSION_ANGLE_LOC_VEL (1u)
+#define PID_FLASH_VERSION_ACCEL_LOC_VEL_NO_AW (2u)
 
 static uint32_t pid_flash_word_len(void)
 {
@@ -84,7 +86,9 @@ static uint8_t pid_flash_valid(const pid_flash_data_t *data)
     if(PID_FLASH_MAGIC != data->magic) {
         return 0;
     }
-    if(PID_FLASH_VERSION != data->version) {
+    if((PID_FLASH_VERSION != data->version) &&
+       (PID_FLASH_VERSION_ANGLE_LOC_VEL != data->version) &&
+       (PID_FLASH_VERSION_ACCEL_LOC_VEL_NO_AW != data->version)) {
         return 0;
     }
     if(pid_flash_checksum(data) != data->checksum) {
@@ -97,6 +101,13 @@ static uint8_t pid_flash_valid(const pid_flash_data_t *data)
 static void pid_flash_apply(const pid_flash_data_t *data)
 {
     for(uint8_t i = 0; i < PID_MENU_ITEM_NUM; i++) {
+        /* Older versions either stored LOC velocity gains in degrees (v1) or
+         * pre-anti-windup acceleration gains (v2).  Keep every other tuned
+         * loop, but retain the current VEL X/Y defaults during migration. */
+        if((data->version < PID_FLASH_VERSION) && (i >= 10u)) {
+            stan_pid_reset(pid_items[i].pid);
+            continue;
+        }
         pid_items[i].pid->kp = data->pid[i][0];
         pid_items[i].pid->ki = data->pid[i][1];
         pid_items[i].pid->kd = data->pid[i][2];

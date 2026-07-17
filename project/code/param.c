@@ -4,10 +4,15 @@
 static float alt_target_vel_z_ramped = 0.0f;
 static float alt_target_height_ramped=0.0f;
 
+#define LOC_TEST_TARGET_HEIGHT_CM  140.0f
+#define LOC_TEST_TARGET_POS_X_CM     0.0f
+#define LOC_TEST_TARGET_POS_Y_CM     0.0f
+
 uint8_t locked_flag = 0;
 uint8_t auto_landing_request = 0;
 uint8_t auto_landing_active = 0;
 volatile uint8_t preflight_error_flags = 0u;
+volatile uint8_t flight_sensor_failsafe_flags = 0u;
 param_t param = {0};
 flight_mode_t flight_mode = {0};
 vehicle_setpoint_t vehicle_setpoint={0}; 
@@ -53,7 +58,7 @@ image_t decoupled_img =
 };
 image_t mapx_img = 
 {
-    .data = (uint8_t *)lut_mapX, // 强转丢弃const，底层 image_remap8 仅作安全读取
+    .data = (uint8_t *)lut_mapX, // Strong cast drops const; image_remap8 only reads the LUT.
     .width = LUT_WIDTH,
     .height = LUT_HEIGHT,
     .step = LUT_WIDTH
@@ -66,23 +71,263 @@ image_t mapy_img =
     .step = LUT_WIDTH
 };
 
+void fisheye_lut_apply(fisheye_lut_id_t id)
+{
+    const fisheye_lut_t *lut = fisheye_lut_get(id);
+
+    mapx_img.data = (uint8_t *)lut->map_x;
+    mapx_img.width = lut->width;
+    mapx_img.height = lut->height;
+    mapx_img.step = lut->width;
+
+    mapy_img.data = (uint8_t *)lut->map_y;
+    mapy_img.width = lut->width;
+    mapy_img.height = lut->height;
+    mapy_img.step = lut->width;
+}
+
+typedef struct
+{
+    uint8_t valid;
+    uint8_t pending;
+    uint8_t accepted;
+    uint8_t error_flags;
+    uint8_t flight_mode;
+    uint8_t imu_valid;
+    uint8_t tof_ok;
+    uint8_t tof_raw_valid;
+    uint8_t tof_stale;
+    uint8_t tof_stuck;
+    uint8_t tof_valid_frames;
+    uint8_t flow_valid;
+    uint8_t flow_raw_valid;
+    uint8_t flow_obs_valid;
+    uint8_t flow_ekf_used;
+    uint8_t flow_quality;
+    uint32_t attempt;
+    uint32_t time_us;
+    uint32_t lc302_bytes;
+    uint32_t lc302_frames;
+    uint32_t lc302_errors;
+    uint32_t lc302_last_rx_us;
+    float flow_ready_time_s;
+    float voltage;
+    float height_cm;
+} preflight_snapshot_t;
+
+typedef struct
+{
+    uint8_t valid;
+    uint8_t pending;
+    uint8_t reason_flags;
+    uint8_t imu_valid;
+    uint8_t tof_ok;
+    uint8_t flow_valid;
+    uint8_t flow_quality;
+    uint32_t time_us;
+    uint32_t lc302_bytes;
+    uint32_t lc302_frames;
+    float voltage;
+    float height_cm;
+} flight_failsafe_snapshot_t;
+
+static preflight_snapshot_t preflight_snapshot = {0};
+static flight_failsafe_snapshot_t flight_failsafe_snapshot = {0};
+static float preflight_flow_ready_time_s = 0.0f;
+static float flight_imu_fault_time_s = 0.0f;
+static float flight_tof_fault_time_s = 0.0f;
+static float flight_flow_fault_time_s = 0.0f;
+static uint8_t flight_flow_required_latched = 0u;
+
+static uint8_t preflight_flow_is_healthy(void)
+{
+    return ((lc302_data.byte_count > 0u) &&
+            (lc302_data.frame_count > 0u) &&
+            (lc302_data.quality >= LC302_QUALITY_MIN) &&
+            (vehicle_state.flow_valid != 0u)) ? 1u : 0u;
+}
+
+static void preflight_capture_snapshot(uint8_t errors,
+                                       uint8_t imu_valid,
+                                       uint8_t tof_ok)
+{
+    preflight_snapshot.attempt++;
+    preflight_snapshot.valid = 1u;
+    preflight_snapshot.pending = 1u;
+    preflight_snapshot.accepted = (errors == 0u) ? 1u : 0u;
+    preflight_snapshot.error_flags = errors;
+    preflight_snapshot.flight_mode = (uint8_t)vehicle_state.flight_mode;
+    preflight_snapshot.imu_valid = imu_valid;
+    preflight_snapshot.tof_ok = tof_ok;
+    preflight_snapshot.tof_raw_valid = tof_health.raw_valid;
+    preflight_snapshot.tof_stale = tof_health.stale;
+    preflight_snapshot.tof_stuck = tof_health.stuck;
+    preflight_snapshot.tof_valid_frames = tof_health.valid_frame_count;
+    preflight_snapshot.flow_valid = vehicle_state.flow_valid;
+    preflight_snapshot.flow_raw_valid = flow_health.raw_valid;
+    preflight_snapshot.flow_obs_valid = flow_health.obs_valid;
+    preflight_snapshot.flow_ekf_used = flow_health.ekf_used;
+    preflight_snapshot.flow_quality = lc302_data.quality;
+    preflight_snapshot.time_us = system_time_us();
+    preflight_snapshot.lc302_bytes = lc302_data.byte_count;
+    preflight_snapshot.lc302_frames = lc302_data.frame_count;
+    preflight_snapshot.lc302_errors = lc302_data.checksum_error_count;
+    preflight_snapshot.lc302_last_rx_us = lc302_data.last_frame_rx_us;
+    preflight_snapshot.flow_ready_time_s = preflight_flow_ready_time_s;
+    preflight_snapshot.voltage = vehicle_state.battery_voltage_filtered;
+    preflight_snapshot.height_cm = vehicle_state.current_height;
+}
+
+static void flight_capture_failsafe_snapshot(uint8_t reasons)
+{
+    if(flight_failsafe_snapshot.valid != 0u)
+    {
+        return;
+    }
+
+    flight_failsafe_snapshot.valid = 1u;
+    flight_failsafe_snapshot.pending = 1u;
+    flight_failsafe_snapshot.reason_flags = reasons;
+    flight_failsafe_snapshot.imu_valid = imu_is_valid();
+    flight_failsafe_snapshot.tof_ok = tof_health_ok();
+    flight_failsafe_snapshot.flow_valid = vehicle_state.flow_valid;
+    flight_failsafe_snapshot.flow_quality = lc302_data.quality;
+    flight_failsafe_snapshot.time_us = system_time_us();
+    flight_failsafe_snapshot.lc302_bytes = lc302_data.byte_count;
+    flight_failsafe_snapshot.lc302_frames = lc302_data.frame_count;
+    flight_failsafe_snapshot.voltage = vehicle_state.battery_voltage_filtered;
+    flight_failsafe_snapshot.height_cm = vehicle_state.current_height;
+}
+
+static void sensor_safety_update(float dT_s)
+{
+    uint8_t reasons = 0u;
+    uint8_t flow_mode_active;
+    uint8_t flow_required;
+
+    if(vehicle_state.armed == 0u)
+    {
+        flight_imu_fault_time_s = 0.0f;
+        flight_tof_fault_time_s = 0.0f;
+        flight_flow_fault_time_s = 0.0f;
+        flight_flow_required_latched = 0u;
+
+        if(preflight_flow_is_healthy() != 0u)
+        {
+            preflight_flow_ready_time_s += dT_s;
+            if(preflight_flow_ready_time_s > PREFLIGHT_FLOW_READY_TIME_S)
+            {
+                preflight_flow_ready_time_s = PREFLIGHT_FLOW_READY_TIME_S;
+            }
+        }
+        else
+        {
+            preflight_flow_ready_time_s = 0.0f;
+        }
+        return;
+    }
+
+    /* A new arm must earn a fresh preflight window after the next disarm. */
+    preflight_flow_ready_time_s = 0.0f;
+
+    if((auto_landing_request != 0u) || (auto_landing_active != 0u))
+    {
+        return;
+    }
+
+    flight_imu_fault_time_s = (imu_is_valid() == 0u) ?
+        (flight_imu_fault_time_s + dT_s) : 0.0f;
+    flight_tof_fault_time_s = (tof_health_ok() == 0u) ?
+        (flight_tof_fault_time_s + dT_s) : 0.0f;
+    flow_mode_active = ((vehicle_state.flight_mode == FLY_POS_HOLD) ||
+                        (vehicle_state.flight_mode == FLY_AUTOFLY) ||
+                        (vehicle_state.flight_mode == FLY_AUTOTAKEOFF)) ? 1u : 0u;
+
+    /* LOC intentionally has no authority close to the floor.  Motor spool-up
+     * can temporarily destroy image quality there, so do not turn that
+     * expected low-altitude interval into an immediate auto-land.  Once the
+     * aircraft reaches the LOC authority zone, latch the Flow requirement for
+     * the rest of this armed flight; a later loss still forces auto-land even
+     * if the vehicle descends below the threshold. */
+    if((flow_mode_active != 0u) &&
+       ((vehicle_state.current_height >= LOC_ENABLE_HEIGHT_CM) ||
+        (loc_1l_ct.loc_ready != 0u) ||
+        (loc_1l_ct.loc_weight > 0.0f)))
+    {
+        flight_flow_required_latched = 1u;
+    }
+    flow_required = ((flow_mode_active != 0u) &&
+                     (flight_flow_required_latched != 0u)) ? 1u : 0u;
+    flight_flow_fault_time_s = ((flow_required != 0u) &&
+                                (vehicle_state.flow_valid == 0u)) ?
+        (flight_flow_fault_time_s + dT_s) : 0.0f;
+
+    if(flight_imu_fault_time_s >= FLIGHT_FAILSAFE_IMU_CONFIRM_S)
+    {
+        reasons |= PREFLIGHT_ERR_IMU;
+    }
+    if(flight_tof_fault_time_s >= FLIGHT_FAILSAFE_TOF_CONFIRM_S)
+    {
+        reasons |= PREFLIGHT_ERR_TOF;
+    }
+    if(flight_flow_fault_time_s >= FLIGHT_FAILSAFE_FLOW_CONFIRM_S)
+    {
+        reasons |= PREFLIGHT_ERR_FLOW_NOT_READY;
+    }
+
+    if(reasons != 0u)
+    {
+        flight_sensor_failsafe_flags = reasons;
+        flight_capture_failsafe_snapshot(reasons);
+        auto_landing_request = 1u;
+    }
+}
+
 
 
 uint8_t preflight_check(void)
 {
     uint8_t errors = 0u;
+    uint8_t imu_valid = imu_is_valid();
+    uint8_t tof_ok = tof_health_ok();
 
-    if(imu_is_valid() == 0u)
+    if(imu_valid == 0u)
     {
         errors |= PREFLIGHT_ERR_IMU;
     }
 
-    if(tof_health_ok() == 0u)
+    if(tof_ok == 0u)
     {
         errors |= PREFLIGHT_ERR_TOF;
     }
 
+#if PREFLIGHT_REQUIRE_FLOW
+    if(lc302_data.byte_count == 0u)
+    {
+        errors |= PREFLIGHT_ERR_FLOW_NO_BYTES;
+    }
+    else if(lc302_data.frame_count == 0u)
+    {
+        errors |= PREFLIGHT_ERR_FLOW_NO_FRAME;
+    }
+    else if(lc302_data.quality < LC302_QUALITY_MIN)
+    {
+        errors |= PREFLIGHT_ERR_FLOW_QUALITY;
+    }
+    else if((vehicle_state.flow_valid == 0u) ||
+            (preflight_flow_ready_time_s < PREFLIGHT_FLOW_READY_TIME_S))
+    {
+        errors |= PREFLIGHT_ERR_FLOW_NOT_READY;
+    }
+#endif
+
     preflight_error_flags = errors;
+    preflight_capture_snapshot(errors, imu_valid, tof_ok);
+    if(errors == 0u)
+    {
+        flight_sensor_failsafe_flags = 0u;
+        memset(&flight_failsafe_snapshot, 0, sizeof(flight_failsafe_snapshot));
+    }
     return (errors == 0u) ? 1u : 0u;
 }
 
@@ -95,151 +340,133 @@ void param_init(void)
 #define DEBUG_STATE_LOG_SAMPLE_COUNT      600u
 #define DEBUG_STATE_LOG_SAMPLE_RATE_HZ    50u
 #define DEBUG_STATE_LOG_START_HEIGHT_CM   45.0f
+#define DEBUG_HISTORY_SAMPLE_COUNT        1000u
 
-typedef struct
-{
+typedef struct {
+    uint32_t seq;
     uint32_t time_us;
-    float height_cm;
-    float target_height_cm;
-    float vel_z_cm_s;
-    float target_vz_cm_s;
-    float throttle;
-    float throttle_ramped;
-    float hover_base;
-    float raw_tof_cm;
-    float tof_innov_cm;
-    float tof_diff_vel;
-    float height_tof_vel_dt_ms;
-    float height_tof_vel_raw;
-    float height_tof_vel_filtered;
-    float height_vel_innov;
-    float acc_ekf_cm_s2;
-    float acc_raw_cm_s2;
-    float acc_bias_cm_s2;
-    float acc_corrected_cm_s2;
-    float acc_lpf_cm_s2;
-    float profile_height_cm;
-    float profile_vz_cm_s;
-    float profile_accel_cm_s2;
-    float profile_error_cm;
-    float position_correction_cm_s;
-    float velocity_command_cm_s;
-    float vel_feedforward;
-    float pid_raw;
-    float pid_weighted;
-    float alt_vel_i;
-    float authority;
-    float vel_feedback_weight;
-    float hover_trim;
-    float hover_base_with_trim;
-    float vel_damping;
-    float near_ground_brake;
-    float throttle_pre_limit;
-    float throttle_post_limit;
-    float throttle_final;
-    float min_throttle;
-    float max_throttle;
+    float dt_ms;
+    uint8_t armed;
+    uint8_t phase;
     float voltage;
-    float pos_x_cm;
-    float pos_y_cm;
-    float target_pos_x_cm;
-    float target_pos_y_cm;
-    float vel_x_cm_s;
-    float vel_y_cm_s;
-    float target_vel_x_cm_s;
-    float target_vel_y_cm_s;
-    float loc_exp_pos_x_cm;
-    float loc_exp_pos_y_cm;
-    float loc_fb_pos_x_cm;
-    float loc_fb_pos_y_cm;
-    float loc_pos_err_x_cm;
-    float loc_pos_err_y_cm;
-    float loc_exp_vel_x_cm_s;
-    float loc_exp_vel_y_cm_s;
-    float loc_fb_vel_x_cm_s;
-    float loc_fb_vel_y_cm_s;
-    float loc_vel_err_x_cm_s;
-    float loc_vel_err_y_cm_s;
-    float loc_vel_err_x_body_cm_s;
-    float loc_vel_err_y_body_cm_s;
-    float loc_roll_out_deg;
-    float loc_pitch_out_deg;
-    float loc_raw_target_roll_deg;
-    float loc_raw_target_pitch_deg;
+    float att_voltage_scale;
+    uint8_t loc_ready;
+    uint8_t loc_hold;
     float loc_weight;
-    float loc_pos_p_x;
-    float loc_pos_i_x;
-    float loc_pos_d_x;
-    float loc_pos_p_y;
-    float loc_pos_i_y;
-    float loc_pos_d_y;
+    float yaw_deg;
+    float pos_err_x_e;
+    float pos_err_y_e;
+    float goal_pos_x_e;
+    float goal_pos_y_e;
+    float profile_pos_x_e;
+    float profile_pos_y_e;
+    float profile_vel_x_e;
+    float profile_vel_y_e;
+    float vel_x_e;
+    float vel_y_e;
+    float vel_tgt_x_e;
+    float vel_tgt_y_e;
+    float vel_err_x_b;
+    float vel_err_y_b;
+    float loc_raw_roll;
+    float loc_raw_pitch;
+    float loc_bias_roll;
+    float loc_bias_pitch;
+    float loc_ramped_roll;
+    float loc_ramped_pitch;
     float loc_vel_p_x;
     float loc_vel_i_x;
     float loc_vel_d_x;
     float loc_vel_p_y;
     float loc_vel_i_y;
     float loc_vel_d_y;
-    float roll_deg;
-    float pitch_deg;
-    float yaw_deg;
-    float target_roll_deg;
-    float target_pitch_deg;
-    float target_yaw_rate_deg_s;
-    float gyro_z_deg_s;
-    float ct_roll;
-    float ct_pitch;
-    float ct_yaw;
-    float rate_exp_r;
-    float rate_exp_p;
-    float rate_exp_y;
+    float roll_tgt;
+    float roll_cur;
+    float pitch_tgt;
+    float pitch_cur;
+    float sp_rate_ff_roll;
+    float sp_rate_ff_pitch;
+    float rate_tgt_r;
     float rate_fb_r;
-    float rate_fb_p;
-    float rate_fb_y;
+    float rate_out_r;
     float rate_p_r;
-    float rate_p_p;
-    float rate_p_y;
     float rate_i_r;
-    float rate_i_p;
-    float rate_i_y;
     float rate_d_r;
-    float rate_d_p;
-    float rate_d_y;
+    float rate_tgt_p;
+    float rate_fb_p;
+    float rate_out_p;
+    float imu_acc_body_y_m_s2;
+    float flow_obs_vx_e;
+    float flow_obs_vy_e;
+    float ekf_vx_e;
+    float ekf_vy_e;
+    uint8_t flow_valid;
+    uint8_t flow_obs_valid;
+    uint8_t flow_ekf_used;
+    uint8_t flow_gate_clipped;
+    float throttle;
+    float height_cm;
+    float vel_z_cm_s;
     int16_t m1;
     int16_t m2;
     int16_t m3;
     int16_t m4;
-    uint8_t phase;
-    uint8_t tof_used;
-    uint8_t vel_used;
-    uint8_t loc_ready;
-    uint8_t loc_hold_ready;
-    uint8_t armed;
-    uint8_t flight_mode;
-    uint8_t flow_valid;
-    uint8_t flow_raw_valid;
-    uint8_t flow_quality_valid;
-    uint8_t flow_obs_valid;
-    uint8_t flow_ekf_used;
-    uint8_t flow_gate_clipped;
-    uint8_t flow_quality;
-    uint16_t flow_accum_count;
-    uint32_t flow_integration_us;
-    uint32_t flow_frame_count;
-    float flow_obs_vx_cm_s;
-    float flow_obs_vy_cm_s;
-    float flow_innov_vx_cm_s;
-    float flow_innov_vy_cm_s;
-    float flow_obs_dt_ms;
-    float flow_gate_limit_cm_s;
 } debug_state_sample_t;
 
+/* A compact 50 Hz flight timeline.  It is intentionally independent of the
+ * detailed state dump: the detailed buffer keeps PID context, while this
+ * buffer retains a longer, always-on history without changing control flow. */
+typedef struct {
+    uint32_t time_us;
+    int16_t pos_err_y_dcm;
+    int16_t ekf_vy_dcms;
+    int16_t raw_roll_cdeg;
+    int16_t roll_cur_cdeg;
+    int16_t loc_vel_i_y_mdeg;
+    int16_t loc_bias_roll_cdeg;
+    int16_t loc_bias_pitch_cdeg;
+    int16_t height_dcm;
+    uint16_t voltage_cV;
+    int16_t flow_obs_vy_dcms;
+    int16_t yaw_cdeg;
+    int16_t yaw_err_cdeg;
+    int16_t yaw_rate_cdps;
+    int16_t yaw_rate_tgt_cdps;
+    int16_t yaw_out_milli;
+    int16_t yaw_rate_p_milli;
+    int16_t yaw_rate_i_milli;
+    int16_t yaw_rate_d_milli;
+    uint16_t m1;
+    uint16_t m2;
+    uint16_t m3;
+    uint16_t m4;
+    uint8_t flow_obs_valid;
+    uint8_t flow_ekf_used;
+    uint8_t flags;
+    uint8_t phase;
+} debug_history_sample_t;
+
 static debug_state_sample_t debug_state_buf[DEBUG_STATE_LOG_SAMPLE_COUNT];
+static debug_history_sample_t debug_history_buf[DEBUG_HISTORY_SAMPLE_COUNT];
 static uint16_t debug_state_count = 0u;
 static uint16_t debug_state_dump_index = 0u;
 static uint8_t debug_state_recording = 0u;
 static uint8_t debug_state_ready = 0u;
 static uint16_t debug_state_wr_idx = 0u;
 static uint8_t debug_state_buffer_full = 0u;
+static uint16_t debug_history_count = 0u;
+static uint16_t debug_history_dump_index = 0u;
+static uint16_t debug_history_wr_idx = 0u;
+static uint8_t debug_history_buffer_full = 0u;
+static uint8_t debug_history_header_printed = 0u;
+
+static int16_t debug_pack_i16(float value, float scale)
+{
+    float packed = value * scale;
+    if(packed > 32767.0f) return 32767;
+    if(packed < -32768.0f) return -32768;
+    return (int16_t)((packed >= 0.0f) ? (packed + 0.5f) : (packed - 0.5f));
+}
 
 /**
  * @brief Capture one coherent 20 ms control snapshot into RAM.
@@ -249,6 +476,7 @@ void debug_capture_states_20ms(void)
 {
     uint32_t now_us = system_time_us();
     uint8_t armed = vehicle_state.armed;
+    static uint32_t last_time_us = 0;
 
     if((armed != 0u) &&
        (alt_phase != ALT_PHASE_LANDING) &&
@@ -261,7 +489,13 @@ void debug_capture_states_20ms(void)
         debug_state_dump_index = 0u;
         debug_state_wr_idx = 0u;
         debug_state_buffer_full = 0u;
+        debug_history_count = 0u;
+        debug_history_dump_index = 0u;
+        debug_history_wr_idx = 0u;
+        debug_history_buffer_full = 0u;
+        debug_history_header_printed = 0u;
         debug_state_recording = 1u;
+        last_time_us = now_us;
     }
 
     if(((armed == 0u) || (alt_phase == ALT_PHASE_LANDING)) &&
@@ -270,149 +504,154 @@ void debug_capture_states_20ms(void)
         debug_state_recording = 0u;
         debug_state_ready = (debug_state_count > 0u) ? 1u : 0u;
         debug_state_dump_index = 0u;
+        debug_history_dump_index = 0u;
+        debug_history_header_printed = 0u;
     }
 
-    // Exactly one sample per caller invocation.  The caller is the 20 ms
-    // control section, so a second wall-clock gate would turn a 19.999 ms
-    // tick into an artificial 40 ms logging gap.
     if(debug_state_recording != 0u)
     {
         debug_state_sample_t *sample = &debug_state_buf[debug_state_wr_idx];
 
+        sample->seq = debug_state_wr_idx;
         sample->time_us = now_us;
-        sample->height_cm = vehicle_state.current_height;
-        sample->target_height_cm = vehicle_setpoint.target_height;
-        sample->vel_z_cm_s = vehicle_state.current_vel_z;
-        sample->target_vz_cm_s = vehicle_setpoint.target_vel_z;
-        sample->throttle = vehicle_setpoint.target_throttle;
-        sample->throttle_ramped = throttle_ramped_debug;
-        sample->hover_base = system_get_hover_throttle_base();
-        sample->raw_tof_cm = tof_dist_cm;
-        sample->tof_innov_cm = ekf_lite_health.tof_innov;
-        sample->tof_diff_vel = tof_diff_vel_debug;
-        sample->height_tof_vel_dt_ms = height_tof_vel_dt_ms_debug;
-        sample->height_tof_vel_raw = height_tof_vel_raw_debug;
-        sample->height_tof_vel_filtered = height_tof_vel_filtered_debug;
-        sample->height_vel_innov = height_vel_innov_debug;
-        sample->acc_ekf_cm_s2 = acc_z_cm_s2;
-        sample->acc_raw_cm_s2 = acc_z_world_raw_cm_s2;
-        sample->acc_bias_cm_s2 = acc_z_world_bias_cm_s2;
-        sample->acc_corrected_cm_s2 = acc_z_world_corrected_cm_s2;
-        sample->acc_lpf_cm_s2 = acc_z_world_lpf_cm_s2;
-        sample->profile_height_cm = alt_ctrl_debug.profile_height;
-        sample->profile_vz_cm_s = alt_ctrl_debug.profile_velocity;
-        sample->profile_accel_cm_s2 = alt_ctrl_debug.profile_acceleration;
-        sample->profile_error_cm = alt_ctrl_debug.profile_error;
-        sample->position_correction_cm_s = alt_ctrl_debug.position_correction;
-        sample->velocity_command_cm_s = alt_ctrl_debug.velocity_command;
-        sample->vel_feedforward = alt_ctrl_debug.vel_feedforward;
-        sample->pid_raw = alt_ctrl_debug.pid_raw;
-        sample->pid_weighted = alt_ctrl_debug.pid_weighted;
-        sample->alt_vel_i = alt_ctrl.vel_pid.out_i;
-        sample->authority = alt_ctrl_debug.authority;
-        sample->vel_feedback_weight = alt_ctrl_debug.vel_feedback_weight;
-        sample->hover_trim = alt_ctrl_debug.hover_trim;
-        sample->hover_base_with_trim = alt_ctrl_debug.hover_base_with_trim;
-        sample->vel_damping = alt_ctrl_debug.vel_damping;
-        sample->near_ground_brake = alt_ctrl_debug.near_ground_brake;
-        sample->throttle_pre_limit = alt_ctrl_debug.throttle_pre_limit;
-        sample->throttle_post_limit = alt_ctrl_debug.throttle_post_limit;
-        sample->throttle_final = alt_ctrl_debug.throttle_final;
-        sample->min_throttle = alt_ctrl_debug.min_throttle;
-        sample->max_throttle = alt_ctrl_debug.max_throttle;
+        sample->dt_ms = (last_time_us == 0) ? 0.0f : (float)(now_us - last_time_us) / 1000.0f;
+        last_time_us = now_us;
+
+        sample->armed = armed;
+        sample->phase = (uint8_t)alt_phase;
         sample->voltage = vehicle_state.battery_voltage_filtered;
-        sample->pos_x_cm = vehicle_state.current_pos_x;
-        sample->pos_y_cm = vehicle_state.current_pos_y;
-        sample->target_pos_x_cm = vehicle_setpoint.target_pos_x;
-        sample->target_pos_y_cm = vehicle_setpoint.target_pos_y;
-        sample->vel_x_cm_s = vehicle_state.current_vel_x;
-        sample->vel_y_cm_s = vehicle_state.current_vel_y;
-        sample->target_vel_x_cm_s = vehicle_setpoint.target_vel_x;
-        sample->target_vel_y_cm_s = vehicle_setpoint.target_vel_y;
-        sample->loc_exp_pos_x_cm = loc_2l_ct.exp_pos_x;
-        sample->loc_exp_pos_y_cm = loc_2l_ct.exp_pos_y;
-        sample->loc_fb_pos_x_cm = loc_2l_ct.fb_pos_x;
-        sample->loc_fb_pos_y_cm = loc_2l_ct.fb_pos_y;
-        sample->loc_pos_err_x_cm = loc_2l_ct.exp_pos_x - loc_2l_ct.fb_pos_x;
-        sample->loc_pos_err_y_cm = loc_2l_ct.exp_pos_y - loc_2l_ct.fb_pos_y;
-        sample->loc_exp_vel_x_cm_s = loc_1l_ct.exp_vel_x;
-        sample->loc_exp_vel_y_cm_s = loc_1l_ct.exp_vel_y;
-        sample->loc_fb_vel_x_cm_s = loc_1l_ct.fb_vel_x;
-        sample->loc_fb_vel_y_cm_s = loc_1l_ct.fb_vel_y;
-        sample->loc_vel_err_x_cm_s = loc_1l_ct.exp_vel_x - loc_1l_ct.fb_vel_x;
-        sample->loc_vel_err_y_cm_s = loc_1l_ct.exp_vel_y - loc_1l_ct.fb_vel_y;
-        sample->loc_vel_err_x_body_cm_s = loc_1l_ct.vel_err_x_body;
-        sample->loc_vel_err_y_body_cm_s = loc_1l_ct.vel_err_y_body;
-        sample->loc_roll_out_deg = loc_output.roll_adj;
-        sample->loc_pitch_out_deg = loc_output.pitch_adj;
-        sample->loc_raw_target_roll_deg = loc_1l_ct.raw_target_roll;
-        sample->loc_raw_target_pitch_deg = loc_1l_ct.raw_target_pitch;
+        sample->att_voltage_scale = att_voltage_output_scale;
+        
+        sample->loc_ready = loc_1l_ct.loc_ready;
+        sample->loc_hold = loc_1l_ct.loc_hold_ready;
         sample->loc_weight = loc_1l_ct.loc_weight;
-        sample->loc_pos_p_x = loc_ctrl.pos_pid[0].out_p;
-        sample->loc_pos_i_x = loc_ctrl.pos_pid[0].out_i;
-        sample->loc_pos_d_x = loc_ctrl.pos_pid[0].out_d;
-        sample->loc_pos_p_y = loc_ctrl.pos_pid[1].out_p;
-        sample->loc_pos_i_y = loc_ctrl.pos_pid[1].out_i;
-        sample->loc_pos_d_y = loc_ctrl.pos_pid[1].out_d;
+        sample->yaw_deg = vehicle_state.current_yaw;
+        
+        /* Keep the log error referenced to the final mission goal.  The LOC
+         * controller's exp_pos is now the moving profile reference. */
+        sample->pos_err_x_e = vehicle_setpoint.target_pos_x - vehicle_state.current_pos_x;
+        sample->pos_err_y_e = vehicle_setpoint.target_pos_y - vehicle_state.current_pos_y;
+        sample->goal_pos_x_e = vehicle_setpoint.target_pos_x;
+        sample->goal_pos_y_e = vehicle_setpoint.target_pos_y;
+        sample->profile_pos_x_e = loc_2l_ct.exp_pos_x;
+        sample->profile_pos_y_e = loc_2l_ct.exp_pos_y;
+        sample->profile_vel_x_e = loc_2l_ct.profile_vel_x;
+        sample->profile_vel_y_e = loc_2l_ct.profile_vel_y;
+        
+        sample->vel_x_e = loc_1l_ct.fb_vel_x;
+        sample->vel_y_e = loc_1l_ct.fb_vel_y;
+        sample->vel_tgt_x_e = loc_1l_ct.exp_vel_x;
+        sample->vel_tgt_y_e = loc_1l_ct.exp_vel_y;
+        
+        sample->vel_err_x_b = loc_1l_ct.vel_err_x_body;
+        sample->vel_err_y_b = loc_1l_ct.vel_err_y_body;
+        
+        sample->loc_raw_roll = loc_1l_ct.raw_target_roll;
+        sample->loc_raw_pitch = loc_1l_ct.raw_target_pitch;
+        sample->loc_bias_roll = loc_1l_ct.horizontal_bias_roll;
+        sample->loc_bias_pitch = loc_1l_ct.horizontal_bias_pitch;
+        sample->loc_ramped_roll = vehicle_setpoint.target_roll;
+        sample->loc_ramped_pitch = vehicle_setpoint.target_pitch;
+        
         sample->loc_vel_p_x = loc_ctrl.vel_pid[0].out_p;
         sample->loc_vel_i_x = loc_ctrl.vel_pid[0].out_i;
         sample->loc_vel_d_x = loc_ctrl.vel_pid[0].out_d;
         sample->loc_vel_p_y = loc_ctrl.vel_pid[1].out_p;
         sample->loc_vel_i_y = loc_ctrl.vel_pid[1].out_i;
         sample->loc_vel_d_y = loc_ctrl.vel_pid[1].out_d;
-        sample->roll_deg = vehicle_state.current_roll;
-        sample->pitch_deg = vehicle_state.current_pitch;
-        sample->yaw_deg = vehicle_state.current_yaw;
-        sample->target_roll_deg = vehicle_setpoint.target_roll;
-        sample->target_pitch_deg = vehicle_setpoint.target_pitch;
-        sample->target_yaw_rate_deg_s = vehicle_setpoint.target_yaw_rate;
-        sample->gyro_z_deg_s = imu_data.gyro_actual[2];
-        sample->ct_roll = ct_val.rol;
-        sample->ct_pitch = ct_val.pit;
-        sample->ct_yaw = ct_val.yaw;
-        sample->rate_exp_r = att_1l_ct.exp_ang_vel[0];
-        sample->rate_exp_p = att_1l_ct.exp_ang_vel[1];
-        sample->rate_exp_y = att_1l_ct.exp_ang_vel[2];
+        
+        sample->roll_tgt = vehicle_setpoint.target_roll;
+        sample->roll_cur = vehicle_state.current_roll;
+        sample->pitch_tgt = vehicle_setpoint.target_pitch;
+        sample->pitch_cur = vehicle_state.current_pitch;
+        
+        sample->sp_rate_ff_roll = att_1l_ct.sp_rate_ff[0];
+        sample->sp_rate_ff_pitch = att_1l_ct.sp_rate_ff[1];
+        
+        sample->rate_tgt_r = att_1l_ct.exp_ang_vel[0];
         sample->rate_fb_r = att_1l_ct.fb_ang_vel[0];
-        sample->rate_fb_p = att_1l_ct.fb_ang_vel[1];
-        sample->rate_fb_y = att_1l_ct.fb_ang_vel[2];
+        sample->rate_out_r = ct_val.rol;
         sample->rate_p_r = att_ctrl.rate_pid[0].out_p;
-        sample->rate_p_p = att_ctrl.rate_pid[1].out_p;
-        sample->rate_p_y = att_ctrl.rate_pid[2].out_p;
         sample->rate_i_r = att_ctrl.rate_pid[0].out_i;
-        sample->rate_i_p = att_ctrl.rate_pid[1].out_i;
-        sample->rate_i_y = att_ctrl.rate_pid[2].out_i;
         sample->rate_d_r = att_ctrl.rate_pid[0].out_d;
-        sample->rate_d_p = att_ctrl.rate_pid[1].out_d;
-        sample->rate_d_y = att_ctrl.rate_pid[2].out_d;
+        
+        sample->rate_tgt_p = att_1l_ct.exp_ang_vel[1];
+        sample->rate_fb_p = att_1l_ct.fb_ang_vel[1];
+        sample->rate_out_p = ct_val.pit;
+        
+        {
+            float imu_linear_acc_body[3];
+            imu_get_linear_acceleration(imu_linear_acc_body);
+            sample->imu_acc_body_y_m_s2 = imu_linear_acc_body[1];
+        }
+        
+        sample->flow_obs_vx_e = flow_health.obs_vx_cm_s;
+        sample->flow_obs_vy_e = flow_health.obs_vy_cm_s;
+        sample->ekf_vx_e = vehicle_state.current_vel_x;
+        sample->ekf_vy_e = vehicle_state.current_vel_y;
+        
+        sample->flow_valid = vehicle_state.flow_valid;
+        sample->flow_obs_valid = flow_health.obs_valid;
+        sample->flow_ekf_used = flow_health.ekf_used;
+        sample->flow_gate_clipped = flow_health.gate_clipped;
+        
+        sample->throttle = vehicle_setpoint.target_throttle;
+        sample->height_cm = vehicle_state.current_height;
+        sample->vel_z_cm_s = vehicle_state.current_vel_z;
+        
         sample->m1 = motor_out.m1;
         sample->m2 = motor_out.m2;
         sample->m3 = motor_out.m3;
         sample->m4 = motor_out.m4;
-        sample->phase = (uint8_t)alt_phase;
-        sample->tof_used = ekf_lite_health.tof_used;
-        sample->vel_used = height_vel_update_used_debug;
-        sample->loc_ready = loc_1l_ct.loc_ready;
-        sample->loc_hold_ready = loc_1l_ct.loc_hold_ready;
-        sample->armed = armed;
-        sample->flight_mode = (uint8_t)vehicle_state.flight_mode;
-        sample->flow_valid = vehicle_state.flow_valid;
-        sample->flow_raw_valid = flow_health.raw_valid;
-        sample->flow_quality_valid = flow_health.quality_valid;
-        sample->flow_obs_valid = flow_health.obs_valid;
-        sample->flow_ekf_used = flow_health.ekf_used;
-        sample->flow_gate_clipped = flow_health.gate_clipped;
-        sample->flow_quality = flow_health.quality;
-        sample->flow_accum_count = flow_health.lc302_accum_count;
-        sample->flow_integration_us = flow_health.lc302_integration_us;
-        sample->flow_frame_count = flow_health.lc302_frame_count;
-        sample->flow_obs_vx_cm_s = flow_health.obs_vx_cm_s;
-        sample->flow_obs_vy_cm_s = flow_health.obs_vy_cm_s;
-        sample->flow_innov_vx_cm_s = flow_health.innov_vx_cm_s;
-        sample->flow_innov_vy_cm_s = flow_health.innov_vy_cm_s;
-        sample->flow_obs_dt_ms = flow_health.obs_dt_s * 1000.0f;
-        sample->flow_gate_limit_cm_s = flow_health.gate_limit_cm_s;
-        
+
+        {
+            debug_history_sample_t *history = &debug_history_buf[debug_history_wr_idx];
+            uint8_t flags = 0u;
+
+            if(loc_1l_ct.loc_hold_ready != 0u) flags |= (1u << 0);
+            if(loc_1l_ct.loc_ready != 0u)      flags |= (1u << 1);
+            if(vehicle_state.flow_valid != 0u) flags |= (1u << 2);
+            if(flow_health.obs_valid != 0u)    flags |= (1u << 3);
+            if(flow_health.ekf_used != 0u)     flags |= (1u << 4);
+
+            history->time_us = now_us;
+            history->pos_err_y_dcm = debug_pack_i16(sample->pos_err_y_e, 10.0f);
+            history->ekf_vy_dcms = debug_pack_i16(sample->ekf_vy_e, 10.0f);
+            history->raw_roll_cdeg = debug_pack_i16(sample->loc_raw_roll, 100.0f);
+            history->roll_cur_cdeg = debug_pack_i16(sample->roll_cur, 100.0f);
+            history->loc_vel_i_y_mdeg = debug_pack_i16(sample->loc_vel_i_y, 1000.0f);
+            history->loc_bias_roll_cdeg = debug_pack_i16(sample->loc_bias_roll, 100.0f);
+            history->loc_bias_pitch_cdeg = debug_pack_i16(sample->loc_bias_pitch, 100.0f);
+            history->height_dcm = debug_pack_i16(sample->height_cm, 10.0f);
+            history->voltage_cV = (uint16_t)LIMIT(sample->voltage * 100.0f + 0.5f, 0.0f, 65535.0f);
+            history->flow_obs_vy_dcms = debug_pack_i16(sample->flow_obs_vy_e, 10.0f);
+            history->yaw_cdeg = debug_pack_i16(sample->yaw_deg, 100.0f);
+            history->yaw_err_cdeg = debug_pack_i16(att_2l_ct.yaw_err, 100.0f);
+            history->yaw_rate_cdps = debug_pack_i16(att_1l_ct.fb_ang_vel[2], 100.0f);
+            history->yaw_rate_tgt_cdps = debug_pack_i16(att_1l_ct.exp_ang_vel[2], 100.0f);
+            history->yaw_out_milli = debug_pack_i16(ct_val.yaw, 1000.0f);
+            history->yaw_rate_p_milli = debug_pack_i16(att_ctrl.rate_pid[2].out_p, 1000.0f);
+            history->yaw_rate_i_milli = debug_pack_i16(att_ctrl.rate_pid[2].out_i, 1000.0f);
+            history->yaw_rate_d_milli = debug_pack_i16(att_ctrl.rate_pid[2].out_d, 1000.0f);
+            history->m1 = (uint16_t)LIMIT((float)sample->m1, 0.0f, 65535.0f);
+            history->m2 = (uint16_t)LIMIT((float)sample->m2, 0.0f, 65535.0f);
+            history->m3 = (uint16_t)LIMIT((float)sample->m3, 0.0f, 65535.0f);
+            history->m4 = (uint16_t)LIMIT((float)sample->m4, 0.0f, 65535.0f);
+            history->flow_obs_valid = sample->flow_obs_valid;
+            history->flow_ekf_used = sample->flow_ekf_used;
+            history->flags = flags;
+            history->phase = sample->phase;
+
+            debug_history_wr_idx++;
+            if(debug_history_wr_idx >= DEBUG_HISTORY_SAMPLE_COUNT)
+            {
+                debug_history_wr_idx = 0u;
+                debug_history_buffer_full = 1u;
+            }
+            debug_history_count = debug_history_buffer_full ?
+                                  DEBUG_HISTORY_SAMPLE_COUNT : debug_history_wr_idx;
+        }
+
         debug_state_wr_idx++;
         if(debug_state_wr_idx >= DEBUG_STATE_LOG_SAMPLE_COUNT)
         {
@@ -426,7 +665,63 @@ void debug_capture_states_20ms(void)
             debug_state_count = debug_state_wr_idx;
         }
     }
+}
 
+static void debug_print_safety_snapshots(void)
+{
+    if(preflight_snapshot.pending != 0u)
+    {
+        printf("[PREFLIGHT],attempt=%lu,result=%s,flags=0x%02X,time_us=%lu,mode=%u,voltage=%.2f,height_cm=%.2f,imu=%u,tof_ok=%u,tof_raw=%u,tof_stale=%u,tof_stuck=%u,tof_frames=%u,flow=%u,flow_raw=%u,flow_obs=%u,flow_ekf=%u,flow_quality=%u,flow_ready_ms=%.0f,lc302_bytes=%lu,lc302_frames=%lu,lc302_errors=%lu,lc302_last_rx_us=%lu,reason_imu=%u,reason_tof=%u,reason_flow_no_bytes=%u,reason_flow_no_frame=%u,reason_flow_quality=%u,reason_flow_not_ready=%u\r\n",
+               (unsigned long)preflight_snapshot.attempt,
+               (preflight_snapshot.accepted != 0u) ? "ACCEPTED" : "BLOCKED",
+               preflight_snapshot.error_flags,
+               (unsigned long)preflight_snapshot.time_us,
+               preflight_snapshot.flight_mode,
+               preflight_snapshot.voltage,
+               preflight_snapshot.height_cm,
+               preflight_snapshot.imu_valid,
+               preflight_snapshot.tof_ok,
+               preflight_snapshot.tof_raw_valid,
+               preflight_snapshot.tof_stale,
+               preflight_snapshot.tof_stuck,
+               preflight_snapshot.tof_valid_frames,
+               preflight_snapshot.flow_valid,
+               preflight_snapshot.flow_raw_valid,
+               preflight_snapshot.flow_obs_valid,
+               preflight_snapshot.flow_ekf_used,
+               preflight_snapshot.flow_quality,
+               preflight_snapshot.flow_ready_time_s * 1000.0f,
+               (unsigned long)preflight_snapshot.lc302_bytes,
+               (unsigned long)preflight_snapshot.lc302_frames,
+               (unsigned long)preflight_snapshot.lc302_errors,
+               (unsigned long)preflight_snapshot.lc302_last_rx_us,
+               (preflight_snapshot.error_flags & PREFLIGHT_ERR_IMU) ? 1u : 0u,
+               (preflight_snapshot.error_flags & PREFLIGHT_ERR_TOF) ? 1u : 0u,
+               (preflight_snapshot.error_flags & PREFLIGHT_ERR_FLOW_NO_BYTES) ? 1u : 0u,
+               (preflight_snapshot.error_flags & PREFLIGHT_ERR_FLOW_NO_FRAME) ? 1u : 0u,
+               (preflight_snapshot.error_flags & PREFLIGHT_ERR_FLOW_QUALITY) ? 1u : 0u,
+               (preflight_snapshot.error_flags & PREFLIGHT_ERR_FLOW_NOT_READY) ? 1u : 0u);
+        preflight_snapshot.pending = 0u;
+    }
+
+    if(flight_failsafe_snapshot.pending != 0u)
+    {
+        printf("[SENSOR_FAILSAFE],action=AUTO_LAND,flags=0x%02X,time_us=%lu,voltage=%.2f,height_cm=%.2f,imu=%u,tof_ok=%u,flow=%u,flow_quality=%u,lc302_bytes=%lu,lc302_frames=%lu,reason_imu=%u,reason_tof=%u,reason_flow=%u\r\n",
+               flight_failsafe_snapshot.reason_flags,
+               (unsigned long)flight_failsafe_snapshot.time_us,
+               flight_failsafe_snapshot.voltage,
+               flight_failsafe_snapshot.height_cm,
+               flight_failsafe_snapshot.imu_valid,
+               flight_failsafe_snapshot.tof_ok,
+               flight_failsafe_snapshot.flow_valid,
+               flight_failsafe_snapshot.flow_quality,
+               (unsigned long)flight_failsafe_snapshot.lc302_bytes,
+               (unsigned long)flight_failsafe_snapshot.lc302_frames,
+               (flight_failsafe_snapshot.reason_flags & PREFLIGHT_ERR_IMU) ? 1u : 0u,
+               (flight_failsafe_snapshot.reason_flags & PREFLIGHT_ERR_TOF) ? 1u : 0u,
+               (flight_failsafe_snapshot.reason_flags & PREFLIGHT_ERR_FLOW_NOT_READY) ? 1u : 0u);
+        flight_failsafe_snapshot.pending = 0u;
+    }
 }
 
 /**
@@ -435,7 +730,7 @@ void debug_capture_states_20ms(void)
  */
 void debug_print_states(void)
 {
-
+#if 0 /* Superseded malformed CSV emitter; retained temporarily for diff context. */
     if((debug_state_ready == 0u) || (vehicle_state.armed != 0u))
     {
         return;
@@ -443,219 +738,192 @@ void debug_print_states(void)
 
     if(debug_state_dump_index == 0u)
     {
-        printf("DEBUG_STATE_BEGIN,count=%u,fs=%u\r\n",
-               debug_state_count,
-               DEBUG_STATE_LOG_SAMPLE_RATE_HZ);
+        printf("FLIGHTCFG,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f\r\n",
+               att_ctrl.angle_pid[0].kp, att_ctrl.angle_pid[1].kp, att_ctrl.angle_pid[2].kp,
+               att_ctrl.rate_pid[0].kp, att_ctrl.rate_pid[0].ki, att_ctrl.rate_pid[0].kd,
+               att_ctrl.rate_pid[1].kp, att_ctrl.rate_pid[1].ki, att_ctrl.rate_pid[1].kd,
+               att_ctrl.rate_pid[2].kp, att_ctrl.rate_pid[2].ki, att_ctrl.rate_pid[2].kd,
+               loc_ctrl.pos_pid[0].kp, loc_ctrl.pos_pid[0].ki, loc_ctrl.pos_pid[0].kd,
+               loc_ctrl.pos_pid[1].kp, loc_ctrl.pos_pid[1].ki, loc_ctrl.pos_pid[1].kd,
+               loc_ctrl.vel_pid[0].kp, loc_ctrl.vel_pid[0].ki, loc_ctrl.vel_pid[0].kd,
+               loc_ctrl.vel_pid[1].kp, loc_ctrl.vel_pid[1].ki, loc_ctrl.vel_pid[1].kd,
+               alt_ctrl.vel_pid.kp, alt_ctrl.vel_pid.ki, alt_ctrl.vel_pid.kd,
+               loc_ctrl.angle_limit, loc_ctrl.vel_limit);
+               
+        printf("seq,time_us,dt_ms,armed,phase,voltage,loc_ready,loc_hold,loc_weight,yaw_deg,pos_err_x_e,pos_err_y_e,vel_x_e,vel_y_e,vel_tgt_x_e,vel_tgt_y_e,vel_err_x_b,vel_err_y_b,loc_raw_roll,loc_raw_pitch,loc_ramped_roll,loc_ramped_pitch,loc_vel_p_x,loc_vel_i_x,loc_vel_d_x,loc_vel_p_y,loc_vel_i_y,loc_vel_d_y,roll_tgt,roll_cur,pitch_tgt,pitch_cur,sp_rate_ff_roll,sp_rate_ff_pitch,rate_tgt_r,rate_fb_r,rate_out_r,rate_p_r,rate_i_r,rate_d_r,rate_tgt_p,rate_fb_p,rate_out_p,imu_acc_body_y_m_s2,flow_obs_vx_e,flow_obs_vy_e,ekf_vx_e,ekf_vy_e,flow_valid,flow_obs_valid,flow_ekf_used,flow_gate_clipped,throttle,height_cm,vel_z_cm_s,m1,m2,m3,m4,att_voltage_scale,goal_pos_x_e,goal_pos_y_e,profile_pos_x_e,profile_pos_y_e,profile_vel_x_e,profile_vel_y_e\r\n");
     }
 
     uint8_t lines = 0u;
-    while((debug_state_dump_index < debug_state_count) && (lines < 1u))
+    while((debug_state_dump_index < debug_state_count) && (lines < 10u))
     {
         uint16_t start_idx = debug_state_buffer_full ? debug_state_wr_idx : 0u;
         uint16_t real_idx = (start_idx + debug_state_dump_index) % DEBUG_STATE_LOG_SAMPLE_COUNT;
         const debug_state_sample_t *sample = &debug_state_buf[real_idx];
 
-        printf("========== DESKTOP DEBUG DASHBOARD [%u/%u] ==========\r\n",
-               debug_state_dump_index,
-               debug_state_count);
-        printf("time_us:%lu voltage:%.3f armed:%u phase:%u\r\n",
-               (unsigned long)sample->time_us,
-               sample->voltage,
-               sample->armed,
-               sample->phase);
-        printf("[FLOWDBG] mode:%u valid:%u raw:%u quality:%u(q=%u) obs:%u ekf:%u clip:%u frame:%lu accum:%u int_us:%lu dt_ms:%.2f\r\n",
-               sample->flight_mode,
-               sample->flow_valid,
-               sample->flow_raw_valid,
-               sample->flow_quality_valid,
-               sample->flow_quality,
-               sample->flow_obs_valid,
-               sample->flow_ekf_used,
-               sample->flow_gate_clipped,
-               (unsigned long)sample->flow_frame_count,
-               sample->flow_accum_count,
-               (unsigned long)sample->flow_integration_us,
-               sample->flow_obs_dt_ms);
-        printf("[FLOWOBS] gate:%.2f obs_xy:%.2f/%.2f innov_xy:%.2f/%.2f\r\n",
-               sample->flow_gate_limit_cm_s,
-               sample->flow_obs_vx_cm_s,
-               sample->flow_obs_vy_cm_s,
-               sample->flow_innov_vx_cm_s,
-               sample->flow_innov_vy_cm_s);
-       printf("[1. ALTITUDE LOOP]\r\n");
-        printf("Height (cm) : Cur: %.3f | Tgt: %.3f\r\n",
-               sample->height_cm,
-               sample->target_height_cm);
-        printf("Vel Z (cm/s): Cur: %.3f | Tgt: %.3f\r\n",
-               sample->vel_z_cm_s,
-               sample->target_vz_cm_s);
-        printf("[ALTTRAJ] z:%.3f v:%.3f a:%.3f err:%.3f corr:%.3f cmd:%.3f\r\n",
-               sample->profile_height_cm,
-               sample->profile_vz_cm_s,
-               sample->profile_accel_cm_s2,
-               sample->profile_error_cm,
-               sample->position_correction_cm_s,
-               sample->velocity_command_cm_s);
-        printf("raw_dist_cm=%.2f\r\n", sample->raw_tof_cm);
-        printf("throttle_out:%.2f | throttle_ramped:%.2f | hover_base:%.2f | hover_trim:%.2f | hover_ff:%.2f\r\n",
-               sample->throttle,
-               sample->throttle_ramped,
-               sample->hover_base,
-               sample->hover_trim,
-               sample->hover_base_with_trim);
-        printf("[ALTDBG] ff:%.3f pid_raw:%.3f pid_w:%.3f auth:%.3f fb_w:%.3f\r\n",
-               sample->vel_feedforward,
-               sample->pid_raw,
-               sample->pid_weighted,
-               sample->authority,
-               sample->vel_feedback_weight);
-        printf("[ALTDBG] damp:%.3f brake:%.3f pre:%.3f post:%.3f final:%.3f lim:[%.3f,%.3f]\r\n",
-               sample->vel_damping,
-               sample->near_ground_brake,
-               sample->throttle_pre_limit,
-               sample->throttle_post_limit,
-               sample->throttle_final,
-               sample->min_throttle,
-               sample->max_throttle);
-        printf("[ALTDBG] vel_i:%.3f\r\n",
-               sample->alt_vel_i);
-       /* printf("[ACCBIAS] raw:%.3f bias:%.3f corrected:%.3f lpf:%.3f ekf_acc:%.3f\r\n",
-               sample->acc_raw_cm_s2,
-               sample->acc_bias_cm_s2,
-               sample->acc_corrected_cm_s2,
-               sample->acc_lpf_cm_s2,
-               sample->acc_ekf_cm_s2);
-        printf("[OBS] tof_used:%u innov:%.3f tof_vel:%.3f vel_dt_ms:%.3f vel_raw:%.3f vel_f:%.3f vel_innov:%.3f vel_used:%u\r\n",
-               sample->tof_used,
-               sample->tof_innov_cm,
-               sample->tof_diff_vel,
-               sample->height_tof_vel_dt_ms,
-               sample->height_tof_vel_raw,
-               sample->height_tof_vel_filtered,
-               sample->height_vel_innov,
-               sample->vel_used);*/
-        printf("[2. LOCATION LOOP]\r\n");
-        printf("Pos X (cm)  : Cur: %.3f | Tgt: %.3f | Err: %.3f\r\n",
-               sample->loc_fb_pos_x_cm,
-               sample->loc_exp_pos_x_cm,
-               sample->loc_pos_err_x_cm);
-        printf("Vel X (cm/s): Cur: %.3f | Tgt: %.3f | Err: %.3f\r\n",
-               sample->loc_fb_vel_x_cm_s,
-               sample->loc_exp_vel_x_cm_s,
-               sample->loc_vel_err_x_cm_s);
-        printf("Pos Y (cm)  : Cur: %.3f | Tgt: %.3f | Err: %.3f\r\n",
-               sample->loc_fb_pos_y_cm,
-               sample->loc_exp_pos_y_cm,
-               sample->loc_pos_err_y_cm);
-        printf("Vel Y (cm/s): Cur: %.3f | Tgt: %.3f | Err: %.3f\r\n",
-               sample->loc_fb_vel_y_cm_s,
-               sample->loc_exp_vel_y_cm_s,
-               sample->loc_vel_err_y_cm_s);
-        printf("[LOCDBG] vel_err body X/Y:%.3f %.3f\r\n",
-               sample->loc_vel_err_x_body_cm_s,
-               sample->loc_vel_err_y_body_cm_s);
-       printf("[LOCDBG] pos_pid X p/i/d:%.3f %.3f %.3f | Y p/i/d:%.3f %.3f %.3f\r\n",
-               sample->loc_pos_p_x,
-               sample->loc_pos_i_x,
-               sample->loc_pos_d_x,
-               sample->loc_pos_p_y,
-               sample->loc_pos_i_y,
-               sample->loc_pos_d_y);
-        printf("[LOCDBG] vel_pid X p/i/d:%.3f %.3f %.3f | Y p/i/d:%.3f %.3f %.3f\r\n",
-               sample->loc_vel_p_x,
-               sample->loc_vel_i_x,
-               sample->loc_vel_d_x,
-               sample->loc_vel_p_y,
-               sample->loc_vel_i_y,
-               sample->loc_vel_d_y);
-        printf("[LOCDBG] raw roll:%.3f pitch:%.3f | sp/ramped roll:%.3f pitch:%.3f\r\n",
-               sample->loc_raw_target_roll_deg,
-               sample->loc_raw_target_pitch_deg,
-               sample->target_roll_deg,
-               sample->target_pitch_deg);
-        printf("[LOCDBG] ready:%u hold:%u weight:%.3f\r\n",
-               sample->loc_ready,
-               sample->loc_hold_ready,
-               sample->loc_weight);
-        printf("[LOCDBG] legacy loc_output roll:%.3f pitch:%.3f\r\n",
-               sample->loc_roll_out_deg,
-               sample->loc_pitch_out_deg);
+        printf("%lu,%lu,%.2f,%u,%u,%.2f,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+               (unsigned long)sample->seq, (unsigned long)sample->time_us, sample->dt_ms, sample->armed, sample->phase, sample->voltage,
+               sample->loc_ready, sample->loc_hold, sample->loc_weight, sample->yaw_deg,
+               sample->pos_err_x_e, sample->pos_err_y_e, sample->vel_x_e, sample->vel_y_e, sample->vel_tgt_x_e, sample->vel_tgt_y_e,
+               sample->vel_err_x_b, sample->vel_err_y_b, sample->loc_raw_roll, sample->loc_raw_pitch, sample->loc_ramped_roll, sample->loc_ramped_pitch,
+               sample->loc_vel_p_x, sample->loc_vel_i_x, sample->loc_vel_d_x, sample->loc_vel_p_y, sample->loc_vel_i_y, sample->loc_vel_d_y,
+               sample->roll_tgt, sample->roll_cur, sample->pitch_tgt, sample->pitch_cur, sample->sp_rate_ff_roll, sample->sp_rate_ff_pitch,
+               sample->rate_tgt_r, sample->rate_fb_r, sample->rate_out_r, sample->rate_p_r, sample->rate_i_r, sample->rate_d_r,
+               sample->rate_tgt_p, sample->rate_fb_p, sample->rate_out_p, sample->imu_acc_body_y_m_s2,
+               sample->flow_obs_vx_e, sample->flow_obs_vy_e, sample->ekf_vx_e, sample->ekf_vy_e,
+               sample->flow_valid, sample->flow_obs_valid, sample->flow_ekf_used, sample->flow_gate_clipped,
+               sample->throttle, sample->height_cm, sample->vel_z_cm_s,
+               sample->m1, sample->m2, sample->m3, sample->m4,
+               sample->att_voltage_scale,
+               sample->goal_pos_x_e, sample->goal_pos_y_e,
+               sample->profile_pos_x_e, sample->profile_pos_y_e,
+               sample->profile_vel_x_e, sample->profile_vel_y_e);
 
-        printf("[3. ATTITUDE LOOP]\r\n");
-        printf("Roll (deg)  : Cur: %3.2f | Tgt: %3.2f -> PID Out: %.2f\r\n",
-               sample->roll_deg,
-               sample->target_roll_deg,
-               sample->ct_roll);
-        printf("Pitch(deg)  : Cur: %3.2f | Tgt: %3.2f -> PID Out: %.2f\r\n",
-               sample->pitch_deg,
-               sample->target_pitch_deg,
-               sample->ct_pitch);
-        printf("Yaw (deg)   : Cur: %3.2f | Gz: %3.2f dps\r\n",
-               sample->yaw_deg,
-               sample->gyro_z_deg_s);
-        printf("YawR(deg/s) : Tgt: %3.2f -> PID Out: %.2f\r\n",
-               sample->target_yaw_rate_deg_s,
-               sample->ct_yaw);
-        printf("Rate R exp/fb/out: %.2f %.2f %.2f | P exp/fb/out: %.2f %.2f %.2f\r\n",
-               sample->rate_exp_r,
-               sample->rate_fb_r,
-               sample->ct_roll,
-               sample->rate_exp_p,
-               sample->rate_fb_p,
-               sample->ct_pitch);
-        printf("Y exp/fb/out: %.2f %.2f %.2f\r\n",
-               sample->rate_exp_y,
-               sample->rate_fb_y,
-               sample->ct_yaw);
-        printf("Rate P R/P/Y: %.3f %.3f %.3f\r\n",
-               sample->rate_p_r,
-               sample->rate_p_p,
-               sample->rate_p_y);
-        printf("Rate I R/P/Y: %.3f %.3f %.3f\r\n",
-               sample->rate_i_r,
-               sample->rate_i_p,
-               sample->rate_i_y);
-        printf("Rate D R/P/Y: %.3f %.3f %.3f\r\n",
-               sample->rate_d_r,
-               sample->rate_d_p,
-               sample->rate_d_y);
-        /* PID configuration is static during a flight; keep it out of the
-         * high-rate diagnostic stream. */
-        /*printf("[PIDCFG] ANG kp R/P/Y: %.3f %.3f %.3f | RATE kp R/P/Y: %.4f %.4f %.4f\r\n",
-               att_ctrl.angle_pid[0].kp,
-               att_ctrl.angle_pid[1].kp,
-               att_ctrl.angle_pid[2].kp,
-               att_ctrl.rate_pid[0].kp,
-               att_ctrl.rate_pid[1].kp,
-               att_ctrl.rate_pid[2].kp);
-        printf("[PIDCFG] RATE ki R/P/Y: %.4f %.4f %.4f | kd R/P/Y: %.5f %.5f %.5f | lp R/P/Y: %.2f %.2f %.2f\r\n",
-               att_ctrl.rate_pid[0].ki,
-               att_ctrl.rate_pid[1].ki,
-               att_ctrl.rate_pid[2].ki,
-               att_ctrl.rate_pid[0].kd,
-               att_ctrl.rate_pid[1].kd,
-               att_ctrl.rate_pid[2].kd,
-               att_ctrl.rate_pid[0].low_pass,
-               att_ctrl.rate_pid[1].low_pass,
-               att_ctrl.rate_pid[2].low_pass);*/
-        printf("[4. MOTOR OUTPUT (0 ~ 10000)]\r\n");
-        printf("M1 (LF_CW) : %5d  |  M2 (RF_CCW): %5d\r\n",
-               sample->m1,
-               sample->m2);
-        printf("M3 (LB_CCW): %5d  |  M4 (RB_CW) : %5d\r\n",
-               sample->m3,
-               sample->m4);
-        printf("=============================================\r\n");
         debug_state_dump_index++;
         lines++;
     }
 
     if(debug_state_dump_index >= debug_state_count)
     {
+        /* Runtime values are loaded from Flash.  Keep this after every CSV
+         * sample so a truncated log still retains the configuration. */
+        printf("FLIGHTCFG,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f\r\n",
+               att_ctrl.angle_pid[0].kp, att_ctrl.angle_pid[1].kp, att_ctrl.angle_pid[2].kp,
+               att_ctrl.rate_pid[0].kp, att_ctrl.rate_pid[0].ki, att_ctrl.rate_pid[0].kd,
+               att_ctrl.rate_pid[1].kp, att_ctrl.rate_pid[1].ki, att_ctrl.rate_pid[1].kd,
+               att_ctrl.rate_pid[2].kp, att_ctrl.rate_pid[2].ki, att_ctrl.rate_pid[2].kd,
+               loc_ctrl.pos_pid[0].kp, loc_ctrl.pos_pid[0].ki, loc_ctrl.pos_pid[0].kd,
+               loc_ctrl.pos_pid[1].kp, loc_ctrl.pos_pid[1].ki, loc_ctrl.pos_pid[1].kd,
+               loc_ctrl.vel_pid[0].kp, loc_ctrl.vel_pid[0].ki, loc_ctrl.vel_pid[0].kd,
+               loc_ctrl.vel_pid[1].kp, loc_ctrl.vel_pid[1].ki, loc_ctrl.vel_pid[1].kd,
+               alt_ctrl.vel_pid.kp, alt_ctrl.vel_pid.ki, alt_ctrl.vel_pid.kd,
+               loc_ctrl.angle_limit, loc_ctrl.vel_limit);
         printf("DEBUG_STATE_END\r\n");
         debug_state_ready = 0u;
         debug_state_count = 0u;
         debug_state_dump_index = 0u;
+    }
+#endif
+
+    if(vehicle_state.armed != 0u)
+    {
+        return;
+    }
+
+    if(debug_state_ready == 0u)
+    {
+        if((preflight_snapshot.pending != 0u) ||
+           (flight_failsafe_snapshot.pending != 0u))
+        {
+            debug_print_safety_snapshots();
+            printf("DEBUG_STATE_END\r\n");
+        }
+        return;
+    }
+
+    if(debug_state_dump_index == 0u)
+    {
+        printf("seq,time_us,dt_ms,armed,phase,voltage,loc_ready,loc_hold,loc_weight,yaw_deg,pos_err_x_e,pos_err_y_e,vel_x_e,vel_y_e,vel_tgt_x_e,vel_tgt_y_e,vel_err_x_b,vel_err_y_b,loc_raw_roll,loc_raw_pitch,loc_bias_roll,loc_bias_pitch,loc_ramped_roll,loc_ramped_pitch,loc_vel_p_x,loc_vel_i_x,loc_vel_d_x,loc_vel_p_y,loc_vel_i_y,loc_vel_d_y,roll_tgt,roll_cur,pitch_tgt,pitch_cur,sp_rate_ff_roll,sp_rate_ff_pitch,rate_tgt_r,rate_fb_r,rate_out_r,rate_p_r,rate_i_r,rate_d_r,rate_tgt_p,rate_fb_p,rate_out_p,imu_acc_body_y_m_s2,flow_obs_vx_e,flow_obs_vy_e,ekf_vx_e,ekf_vy_e,flow_valid,flow_obs_valid,flow_ekf_used,flow_gate_clipped,throttle,height_cm,vel_z_cm_s,m1,m2,m3,m4,att_voltage_scale,goal_pos_x_e,goal_pos_y_e,profile_pos_x_e,profile_pos_y_e,profile_vel_x_e,profile_vel_y_e\r\n");
+    }
+
+    uint8_t lines = 0u;
+    while((debug_state_dump_index < debug_state_count) && (lines < 10u))
+    {
+        uint16_t start_idx = debug_state_buffer_full ? debug_state_wr_idx : 0u;
+        uint16_t real_idx = (start_idx + debug_state_dump_index) % DEBUG_STATE_LOG_SAMPLE_COUNT;
+        const debug_state_sample_t *sample = &debug_state_buf[real_idx];
+
+        printf("%lu,%lu,%.2f,%u,%u,%.2f,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+               (unsigned long)sample->seq, (unsigned long)sample->time_us, sample->dt_ms, sample->armed, sample->phase, sample->voltage,
+               sample->loc_ready, sample->loc_hold, sample->loc_weight, sample->yaw_deg,
+               sample->pos_err_x_e, sample->pos_err_y_e, sample->vel_x_e, sample->vel_y_e, sample->vel_tgt_x_e, sample->vel_tgt_y_e,
+               sample->vel_err_x_b, sample->vel_err_y_b, sample->loc_raw_roll, sample->loc_raw_pitch, sample->loc_bias_roll, sample->loc_bias_pitch, sample->loc_ramped_roll, sample->loc_ramped_pitch,
+               sample->loc_vel_p_x, sample->loc_vel_i_x, sample->loc_vel_d_x, sample->loc_vel_p_y, sample->loc_vel_i_y, sample->loc_vel_d_y,
+               sample->roll_tgt, sample->roll_cur, sample->pitch_tgt, sample->pitch_cur, sample->sp_rate_ff_roll, sample->sp_rate_ff_pitch,
+               sample->rate_tgt_r, sample->rate_fb_r, sample->rate_out_r, sample->rate_p_r, sample->rate_i_r, sample->rate_d_r,
+               sample->rate_tgt_p, sample->rate_fb_p, sample->rate_out_p, sample->imu_acc_body_y_m_s2,
+               sample->flow_obs_vx_e, sample->flow_obs_vy_e, sample->ekf_vx_e, sample->ekf_vy_e,
+               sample->flow_valid, sample->flow_obs_valid, sample->flow_ekf_used, sample->flow_gate_clipped,
+               sample->throttle, sample->height_cm, sample->vel_z_cm_s,
+               sample->m1, sample->m2, sample->m3, sample->m4,
+               sample->att_voltage_scale,
+               sample->goal_pos_x_e, sample->goal_pos_y_e,
+               sample->profile_pos_x_e, sample->profile_pos_y_e,
+               sample->profile_vel_x_e, sample->profile_vel_y_e);
+
+        debug_state_dump_index++;
+        lines++;
+    }
+
+    if(debug_state_dump_index < debug_state_count)
+    {
+        return;
+    }
+
+    if(debug_history_header_printed == 0u)
+    {
+        /* Packed units: dcm=0.1 cm, dcms=0.1 cm/s, cdeg=0.01 deg,
+         * cdps=0.01 deg/s, mdeg=0.001 deg, cV=0.01 V.  Flags: bit0 hold, bit1 ready,
+         * bit2 flow_valid, bit3 flow_obs_valid, bit4 flow_ekf_used. */
+        printf("HISTORY_STATE_BEGIN,count=%u,fs=%u\r\n",
+               debug_history_count, DEBUG_STATE_LOG_SAMPLE_RATE_HZ);
+        printf("hseq,time_us,pos_err_y_dcm,ekf_vy_dcms,raw_roll_cdeg,roll_cur_cdeg,loc_vel_i_y_mdeg,loc_bias_roll_cdeg,loc_bias_pitch_cdeg,height_dcm,voltage_cV,flow_obs_vy_dcms,yaw_cdeg,yaw_err_cdeg,yaw_rate_cdps,yaw_rate_tgt_cdps,yaw_out_milli,yaw_rate_p_milli,yaw_rate_i_milli,yaw_rate_d_milli,m1,m2,m3,m4,flow_obs_valid,flow_ekf_used,flags,phase\r\n");
+        debug_history_header_printed = 1u;
+    }
+
+    lines = 0u;
+    while((debug_history_dump_index < debug_history_count) && (lines < 20u))
+    {
+        uint16_t start_idx = debug_history_buffer_full ? debug_history_wr_idx : 0u;
+        uint16_t real_idx = (start_idx + debug_history_dump_index) % DEBUG_HISTORY_SAMPLE_COUNT;
+        const debug_history_sample_t *history = &debug_history_buf[real_idx];
+
+        printf("%u,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u\r\n",
+               debug_history_dump_index, (unsigned long)history->time_us,
+               history->pos_err_y_dcm, history->ekf_vy_dcms,
+               history->raw_roll_cdeg, history->roll_cur_cdeg,
+               history->loc_vel_i_y_mdeg, history->loc_bias_roll_cdeg,
+               history->loc_bias_pitch_cdeg, history->height_dcm,
+               history->voltage_cV, history->flow_obs_vy_dcms, history->yaw_cdeg,
+               history->yaw_err_cdeg, history->yaw_rate_cdps, history->yaw_rate_tgt_cdps,
+               history->yaw_out_milli, history->yaw_rate_p_milli,
+               history->yaw_rate_i_milli, history->yaw_rate_d_milli,
+               history->m1, history->m2, history->m3, history->m4,
+               history->flow_obs_valid, history->flow_ekf_used,
+               history->flags, history->phase);
+        debug_history_dump_index++;
+        lines++;
+    }
+
+    if(debug_history_dump_index >= debug_history_count)
+    {
+        /* Runtime values are loaded from Flash.  This is deliberately last. */
+        printf("FLIGHTCFG,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f\r\n",
+               att_ctrl.angle_pid[0].kp, att_ctrl.angle_pid[1].kp, att_ctrl.angle_pid[2].kp,
+               att_ctrl.rate_pid[0].kp, att_ctrl.rate_pid[0].ki, att_ctrl.rate_pid[0].kd,
+               att_ctrl.rate_pid[1].kp, att_ctrl.rate_pid[1].ki, att_ctrl.rate_pid[1].kd,
+               att_ctrl.rate_pid[2].kp, att_ctrl.rate_pid[2].ki, att_ctrl.rate_pid[2].kd,
+               loc_ctrl.pos_pid[0].kp, loc_ctrl.pos_pid[0].ki, loc_ctrl.pos_pid[0].kd,
+               loc_ctrl.pos_pid[1].kp, loc_ctrl.pos_pid[1].ki, loc_ctrl.pos_pid[1].kd,
+               loc_ctrl.vel_pid[0].kp, loc_ctrl.vel_pid[0].ki, loc_ctrl.vel_pid[0].kd,
+               loc_ctrl.vel_pid[1].kp, loc_ctrl.vel_pid[1].ki, loc_ctrl.vel_pid[1].kd,
+               alt_ctrl.vel_pid.kp, alt_ctrl.vel_pid.ki, alt_ctrl.vel_pid.kd,
+               LOC_MAX_OUTPUT_ANGLE_DEG, MAX_HORIZONTAL_SPEED);
+        printf("LOCBIASCFG,enabled=0,steady_bias_source=VEL_I,i_max_cm_s2=20.0\r\n");
+        printf("PROFILECFG,pos_correction_cm_s=%.1f,profile_near_cm_s=%.1f,profile_far_cm_s=%.1f,total_vel_cm_s=%.1f,leash_start_cm=%.1f,leash_max_cm=%.1f,opposing_ff=blocked\r\n",
+               LOC_POS_CORRECTION_LIMIT_CM_S,
+               LOC_PROFILE_NEAR_SPEED_CM_S,
+               LOC_PROFILE_FAR_SPEED_CM_S,
+               LOC_TOTAL_VEL_LIMIT_CM_S,
+               LOC_PROFILE_LEASH_START_CM,
+               LOC_PROFILE_LEASH_MAX_CM);
+        debug_print_safety_snapshots();
+        printf("DEBUG_STATE_END\r\n");
+        debug_state_ready = 0u;
+        debug_state_count = 0u;
+        debug_state_dump_index = 0u;
+        debug_history_count = 0u;
+        debug_history_dump_index = 0u;
+        debug_history_header_printed = 0u;
     }
 }
 
@@ -666,21 +934,17 @@ void debug_print_states(void)
  */
 void param_update(float dT_s)
 {
-    // 1. 解析遥控器数据，获得干净的杆量输入 `manual_input`
-    prase_remote_ctrl_data(dT_s);
-
     if(dT_s <= 0.0f || dT_s > 0.1f)
     {
         dT_s = REMOTE_SAMPLE_TIME;
     }
 
-    if((vehicle_state.armed != 0u) && (tof_health_ok() == 0u))
-    {
-        vehicle_state.armed = 0u;
-        auto_landing_request = 0u;
-        auto_landing_active = 0u;
-        return;
-    }
+    /* Update health timers before accepting a new arm edge.  In flight this
+     * can only request the controlled landing state; it never cuts motors. */
+    sensor_safety_update(dT_s);
+
+    // 1. 解析遥控器数据，获得干净的杆量输入 `manual_input`
+    prase_remote_ctrl_data(dT_s);
 
     // 安全保护：未解锁时，所有期望值贴住当前状态，避免解锁瞬间跳变。
     if (vehicle_state.armed == 0)
@@ -714,8 +978,12 @@ void param_update(float dT_s)
         vehicle_setpoint.target_pitch = 0.0f;
         vehicle_setpoint.target_yaw_rate = 0.0f;
 
-        if((vehicle_state.current_height <= AUTO_LAND_DISARM_HEIGHT_CM) &&
-           (fabsf(vehicle_state.current_vel_z) <= AUTO_LAND_DISARM_VEL_CM_S))
+        /* Normal path uses ToF height/velocity.  If ToF itself caused the
+         * failsafe, the altitude state may be stale; in that case the
+         * throttle-based landed detector in alt_ctrl provides the fallback. */
+        if((alt_phase == ALT_PHASE_LANDED) ||
+           ((vehicle_state.current_height <= AUTO_LAND_DISARM_HEIGHT_CM) &&
+            (fabsf(vehicle_state.current_vel_z) <= AUTO_LAND_DISARM_VEL_CM_S)))
         {
             vehicle_state.armed = 0u;
             auto_landing_request = 0u;
@@ -758,7 +1026,7 @@ void param_update(float dT_s)
 #elif LOC_ONLY_MODE_ENABLE
     // 只测位置环：右杆给水平速度目标，油门杆仍直接给基础油门，方便低油门带桨固定测试。
     vehicle_state.flight_mode = FLY_POS_HOLD;
-    vehicle_setpoint.target_height =70.0f;
+    vehicle_setpoint.target_height = LOC_TEST_TARGET_HEIGHT_CM;
     vehicle_setpoint.target_yaw_rate = 0;//manual_input.yaw_rate;
     //vehicle_setpoint.target_throttle = LIMIT(manual_input.climb_rate / MAX_VEL_XYZ * MAX_CT_VAL, 0.0f, MAX_CT_VAL);
 
@@ -766,11 +1034,20 @@ void param_update(float dT_s)
     {
         //vehicle_setpoint.target_pos_x += vel_earth_x * dT_s;
         //vehicle_setpoint.target_pos_y += vel_earth_y * dT_s;
-        if((alt_phase != ALT_PHASE_HOLD) ||
-           (vehicle_state.current_height < LOC_ENABLE_HEIGHT_CM))
+        if((vehicle_state.current_height < LOC_ENABLE_HEIGHT_CM) ||
+           (loc_1l_ct.loc_hold_ready == 0u))
         {
             vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
             vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+        }
+        else
+        {
+            /* Position capture is intentionally independent of ALTTRAJ.  As
+             * soon as the fixed low-altitude/low-speed LOC gate has completed,
+             * start the profile from the captured point toward the local-EKF
+             * origin while the altitude trajectory continues to climb. */
+            vehicle_setpoint.target_pos_x = LOC_TEST_TARGET_POS_X_CM;
+            vehicle_setpoint.target_pos_y = LOC_TEST_TARGET_POS_Y_CM;
         }
 
     }
