@@ -10,22 +10,37 @@
 #define MAX_VEL_CT_VAL        50.0f
 #define LOC_GRAVITY_CM_S2          980.665f
 #define LOC_MAX_HORIZONTAL_ACCEL_CM_S2  138.0f
-#define LOC_POS_CORRECTION_LIMIT_CM_S 10.0f
-#define LOC_PROFILE_NEAR_SPEED_CM_S    7.0f
-#define LOC_PROFILE_FAR_SPEED_CM_S    15.0f
+
+#define LOC_POS_CORRECTION_LIMIT_CM_S 15.0f
+
+#define LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S 12.0f
+
+#define LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S       15.0f
+#define LOC_TERMINAL_APPROACH_RADIUS_CM         40.0f
+#define LOC_TERMINAL_CRUISE_RADIUS_CM          100.0f
+#define LOC_TERMINAL_VEL_DAMPING_SCALE           1.65f
+
+#define LOC_PROFILE_NEAR_SPEED_CM_S    5.0f
+#define LOC_PROFILE_FAR_SPEED_CM_S    45.0f
 #define LOC_PROFILE_BLEND_START_CM    20.0f
 #define LOC_PROFILE_BLEND_END_CM      80.0f
-#define LOC_TOTAL_VEL_LIMIT_CM_S      15.0f
+#define LOC_TOTAL_VEL_LIMIT_CM_S      45.0f
 #define LOC_PROFILE_LEASH_START_CM    12.0f
 #define LOC_PROFILE_LEASH_MAX_CM      40.0f
+
+#define LOC_PROFILE_LEASH_MIN_SPEED_SCALE 0.40f
 #define LOC_TARGET_VEL_SLEW_CM_S2  30.0f
+
+#define LOC_RECOVERY_BRAKE_MARGIN_CM_S      3.0f
+#define LOC_RECOVERY_BRAKE_VEL_SLEW_CM_S2 120.0f
 #define LOC_TRAJ_ACCEL_CM_S2       30.0f
 #define LOC_TARGET_ANGEL_SLEW_DEG_S2  40.0f
 #define LOC_HOLD_TARGET_ANGEL_SLEW_DEG_S2  30.0f
-#define LOC_HOLD_VEL_ERR_LPF_ALPHA_MIN 0.30f
+#define LOC_HOLD_VEL_ERR_LPF_ALPHA_MIN 0.45f
 #define LOC_HOLD_VEL_ERR_LPF_ALPHA_MAX 0.60f
 #define LOC_HOLD_VEL_ERR_DEADBAND_MAX_CM_S 1.0f
 #define LOC_HOLD_VEL_ERR_DEADBAND_MIN_CM_S 0.5f
+#define LOC_VEL_I_OPPOSE_DECAY             0.96f
 #define LOC_HOLD_ERR_RELAX_CM 8.0f
 #define LOC_HOLD_ERR_ACTIVE_CM 18.0f
 #define LOC_ENABLE_HEIGHT_CM       50.0f
@@ -86,6 +101,9 @@ typedef struct {
     float horizontal_bias_roll;
     float horizontal_bias_pitch;
     float loc_weight;
+    float recovery_closing_speed;
+    float recovery_stop_speed;
+    uint8_t recovery_brake_active;
     uint8_t loc_ready;
     uint8_t loc_hold_ready;
 } loc_1l_ct_t;

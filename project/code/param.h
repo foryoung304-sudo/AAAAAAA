@@ -24,10 +24,8 @@
 
 #define AUTO_LAND_TRIGGER_HEIGHT_CM      12.0f
 #define AUTO_LAND_TARGET_HEIGHT_CM       MIN_HEIGHT
-/* Keep a margin above MIN_HEIGHT for ToF noise and the final descent
- * transient; disarm still also requires low vertical speed and the guarded
- * low-throttle dwell in alt_ctrl. */
-#define AUTO_LAND_DISARM_HEIGHT_CM       8.5f
+/* In automatic landing, reaching this measured height disarms immediately. */
+#define AUTO_LAND_DISARM_HEIGHT_CM       9.0f
 #define AUTO_LAND_DISARM_VEL_CM_S        5.0f
 
 #define PREFLIGHT_ERR_IMU                (1u << 0)

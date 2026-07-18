@@ -140,6 +140,7 @@ uint8 imu_chip_id_is_ok(void);
 // 数据处理函数
 void imu_calc(void);
 uint32 imu_get_bad_frame_count(void);
+uint8 imu_attitude_is_valid(void);
 uint8 imu_is_valid(void);
 
 // 辅助功能函数

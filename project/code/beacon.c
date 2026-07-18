@@ -1,7 +1,10 @@
 #include "zf_common_headfile.h"
+#include "beacon.h"
+#include "vision_nav.h"
 
 // 信标信息结构
 BeaconInfo beacon;
+YCarInfo_t ycar_info;
 
 // 误差相关变量
 float erro;              // 当前误差（信标中心与图像中心的X偏移）
@@ -10,125 +13,1073 @@ float erro_yawan;        // 偏航误差
 float erro_yawan_back;   // 上一次偏航误差
 float last_erro = 94;   // 最后一次误差（初始值94）
 
+uint8_t debug_blob_cnt = 0;
+float debug_beacon_score = 0.0f;
+uint8_t debug_beacon_lost = 0;
+float debug_ycar_angle = 0.0f;
+uint8_t debug_ycar_lost = 0;
+float beacon_corr_x = 0.0f;
+float beacon_corr_y = 0.0f;
+float beacon_body_x = 0.0f;
+float beacon_body_y = 0.0f;
+float ycar_body_x = 0.0f;
+float ycar_body_y = 0.0f;
+float ycar_head_body_x = 0.0f;
+float ycar_head_body_y = 0.0f;
+
+static uint8_t label_buf[MT9V03X_H][MT9V03X_W];
+static uint8_t beacon_lost_cnt = 0;
+static uint8_t ycar_lost_cnt = 0;
+
+static void beacon_calibration_log(void)
+{
+#if BEACON_CAL_DEBUG_ENABLE
+    static uint32_t last_log_time_us = 0u;
+    static uint8_t header_printed = 0u;
+    uint32_t now_us = system_time_us();
+
+    if(now_us - last_log_time_us < BEACON_CAL_DEBUG_INTERVAL_US)
+    {
+        return;
+    }
+    last_log_time_us = now_us;
+
+    if(header_printed == 0u)
+    {
+        printf("BCAL_HEADER,time_us,height_cm,roll_deg,pitch_deg,yaw_deg,valid,raw_x,raw_y,corr_x,corr_y,body_x_px,body_y_px,area,lost_frames,blob_count,score\r\n");
+        header_printed = 1u;
+    }
+
+    printf("BCAL,%lu,%.2f,%.3f,%.3f,%.3f,%u,%d,%d,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%.2f\r\n",
+           (unsigned long)now_us,
+           vehicle_state.current_height,
+           imu_data.roll,
+           imu_data.pitch,
+           imu_data.yaw,
+           (unsigned int)(beacon.status == BEACON_FOUND),
+           beacon.centerX,
+           beacon.centerY,
+           beacon_corr_x,
+           beacon_corr_y,
+           beacon_body_x,
+           beacon_body_y,
+           (unsigned int)beacon.area,
+           (unsigned int)debug_beacon_lost,
+           (unsigned int)debug_blob_cnt,
+           debug_beacon_score);
+#endif
+}
+static uint8_t ir_blob_label_to_index[128];
+
+static uint8_t ycar_label_gray(const image_t *img,
+                               uint16_t area_table[],
+                               int min_x[], int max_x[],
+                               int min_y[], int max_y[]);
+
+static void image_point_to_body_offset(float img_x, float img_y,
+                                       float *body_x, float *body_y)
+{
+    *body_x = IMAGE_CENTER_Y - img_y;
+    *body_y = img_x - IMAGE_CENTER_X;
+}
+
+static void image_vector_to_body_vector(float img_x, float img_y,
+                                        float *body_x, float *body_y)
+{
+    *body_x = -img_y;
+    *body_y = img_x;
+}
+
+#ifndef ABS
+#define ABS(x) ((x) < 0 ? -(x) : (x))
+#endif
+
+static uint8_t label_find(uint8_t parent[], uint8_t x)
+{
+    while(parent[x] != x)
+    {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    return x;
+}
+
+static void label_union(uint8_t parent[], uint8_t a, uint8_t b)
+{
+    uint8_t ra = label_find(parent, a);
+    uint8_t rb = label_find(parent, b);
+
+    if(ra == rb) return;
+    if(ra < rb) parent[rb] = ra;
+    else        parent[ra] = rb;
+}
+
+uint8_t beacon_find_blobs_gray(const image_t *img, BeaconBlob_t blobs[], uint8_t max_blobs)
+{
+    uint8_t parent[128];
+    uint8_t next_label = 1;
+    uint8_t label_map[128] = {0};
+    uint16_t area[128] = {0};
+    uint32_t sum_x[128] = {0};
+    uint32_t sum_y[128] = {0};
+    uint32_t sum_v[128] = {0};
+    uint8_t component_cnt = 0;
+
+    memset(label_buf, 0, sizeof(label_buf));
+    memset(blobs, 0, sizeof(BeaconBlob_t) * max_blobs);
+
+    for(uint8_t i = 0; i < 128; i++) parent[i] = i;
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            if(AT_IMAGE(img, x, y) < IR_THRESHOLD) continue;
+
+            uint8_t best = 0;
+            uint8_t n;
+
+            if(x > 0)
+            {
+                n = label_buf[y][x - 1];
+                if(n != 0) best = n;
+            }
+            if(y > 0)
+            {
+                n = label_buf[y - 1][x];
+                if(n != 0 && (best == 0 || n < best)) best = n;
+            }
+            if(x > 0 && y > 0)
+            {
+                n = label_buf[y - 1][x - 1];
+                if(n != 0 && (best == 0 || n < best)) best = n;
+            }
+            if((x + 1) < img->width && y > 0)
+            {
+                n = label_buf[y - 1][x + 1];
+                if(n != 0 && (best == 0 || n < best)) best = n;
+            }
+
+            if(best == 0)
+            {
+                if(next_label >= 128) continue;
+                best = next_label++;
+            }
+
+            label_buf[y][x] = best;
+
+            if(x > 0)
+            {
+                n = label_buf[y][x - 1];
+                if(n != 0) label_union(parent, best, n);
+            }
+            if(y > 0)
+            {
+                n = label_buf[y - 1][x];
+                if(n != 0) label_union(parent, best, n);
+            }
+            if(x > 0 && y > 0)
+            {
+                n = label_buf[y - 1][x - 1];
+                if(n != 0) label_union(parent, best, n);
+            }
+            if((x + 1) < img->width && y > 0)
+            {
+                n = label_buf[y - 1][x + 1];
+                if(n != 0) label_union(parent, best, n);
+            }
+        }
+    }
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            uint8_t label = label_buf[y][x];
+            if(label == 0) continue;
+
+            label = label_find(parent, label);
+            if(label_map[label] == 0)
+            {
+                if(component_cnt >= 127) continue;
+                label_map[label] = ++component_cnt;
+            }
+
+            uint8_t id = label_map[label];
+            area[id]++;
+            sum_x[id] += (uint32_t)x;
+            sum_y[id] += (uint32_t)y;
+            sum_v[id] += (uint32_t)AT_IMAGE(img, x, y);
+        }
+    }
+
+    uint8_t out_cnt = 0;
+    for(uint8_t id = 1; id <= component_cnt && out_cnt < max_blobs; id++)
+    {
+        if(area[id] < BEACON_AREA_MIN || area[id] > BEACON_AREA_MAX) continue;
+
+        blobs[out_cnt].cx = (int16_t)((sum_x[id] + area[id] / 2u) / area[id]);
+        blobs[out_cnt].cy = (int16_t)((sum_y[id] + area[id] / 2u) / area[id]);
+        blobs[out_cnt].area = area[id];
+        blobs[out_cnt].brightness = (uint16_t)(sum_v[id] / area[id]);
+        blobs[out_cnt].valid = 1;
+        out_cnt++;
+    }
+
+    return out_cnt;
+}
+
+uint8_t ir_find_blobs_gray(const image_t *img, IrBlob_t blobs[], uint8_t max_blobs)
+{
+    uint16_t area_tbl[128];
+    int minx[128], maxx[128], miny[128], maxy[128];
+    uint32_t sumx[128] = {0};
+    uint32_t sumy[128] = {0};
+    uint32_t sumv[128] = {0};
+    uint8_t labels;
+    uint8_t out_cnt = 0;
+
+    memset(blobs, 0, sizeof(IrBlob_t) * max_blobs);
+    memset(ir_blob_label_to_index, 0xFF, sizeof(ir_blob_label_to_index));
+
+    labels = ycar_label_gray(img, area_tbl, minx, maxx, miny, maxy);
+    if(labels == 0) return 0;
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            uint8_t lbl = label_buf[y][x];
+            if(lbl == 0) continue;
+            sumx[lbl] += (uint32_t)x;
+            sumy[lbl] += (uint32_t)y;
+            sumv[lbl] += (uint32_t)AT_IMAGE(img, x, y);
+        }
+    }
+
+    for(uint8_t i = 1; i <= labels && out_cnt < max_blobs; i++)
+    {
+        uint16_t area = area_tbl[i];
+        if(area == 0) continue;
+
+        int bw = maxx[i] - minx[i] + 1;
+        int bh = maxy[i] - miny[i] + 1;
+        if(bw <= 0 || bh <= 0) continue;
+
+        blobs[out_cnt].cx = (int16_t)((sumx[i] + area / 2u) / area);
+        blobs[out_cnt].cy = (int16_t)((sumy[i] + area / 2u) / area);
+        blobs[out_cnt].min_x = (int16_t)minx[i];
+        blobs[out_cnt].max_x = (int16_t)maxx[i];
+        blobs[out_cnt].min_y = (int16_t)miny[i];
+        blobs[out_cnt].max_y = (int16_t)maxy[i];
+        blobs[out_cnt].area = area;
+        blobs[out_cnt].brightness = (uint16_t)(sumv[i] / area);
+        blobs[out_cnt].aspect = (bw > bh) ? ((float)bw / (float)bh) : ((float)bh / (float)bw);
+        blobs[out_cnt].fill = (float)area / ((float)bw * (float)bh);
+        blobs[out_cnt].type = IR_BLOB_UNKNOWN;
+        blobs[out_cnt].label = i;
+        blobs[out_cnt].valid = 1;
+        ir_blob_label_to_index[i] = out_cnt;
+        out_cnt++;
+    }
+
+    return out_cnt;
+}
+
+void classify_ir_blobs(IrBlob_t blobs[], uint8_t blob_cnt)
+{
+    for(uint8_t i = 0; i < blob_cnt; i++)
+    {
+        if(!blobs[i].valid) continue;
+
+        blobs[i].type = IR_BLOB_UNKNOWN;
+
+        if(blobs[i].brightness >= IR_THRESHOLD &&
+           blobs[i].area >= BEACON_AREA_MIN &&
+           blobs[i].area <= BEACON_AREA_MAX &&
+           blobs[i].aspect < 1.7f &&
+           blobs[i].fill > 0.35f)
+        {
+            blobs[i].type = IR_BLOB_BEACON_CANDIDATE;
+        }
+
+        else if(blobs[i].area >= CAR_BLOB_MIN_AREA)
+        {
+            blobs[i].type = IR_BLOB_YCAR_PART;
+        }
+    }
+}
+
+void detect_beacon_from_ir_blobs(const IrBlob_t blobs[], uint8_t blob_cnt, BeaconInfo *info)
+{
+    uint8_t best = 0;
+    uint8_t found = 0;
+    float best_score = -100000.0f;
+    static int16_t prev_cx = -1;
+    static int16_t prev_cy = -1;
+    static int16_t filt_cx = -1;
+    static int16_t filt_cy = -1;
+
+    info->status = BEACON_NOT_FOUND;
+    info->centerX = 0;
+    info->centerY = 0;
+    info->area = 0;
+    info->sum = 0;
+
+    for(uint8_t i = 0; i < blob_cnt; i++)
+    {
+        float score;
+        float cx_dist;
+
+        if(!blobs[i].valid || blobs[i].type != IR_BLOB_BEACON_CANDIDATE) continue;
+
+        score = (float)blobs[i].brightness;
+        score += (float)blobs[i].area * 0.5f;
+
+        cx_dist = (float)(MT9V03X_W / 2 - blobs[i].cx);
+        if(cx_dist < 0.0f) cx_dist = -cx_dist;
+        score += ((float)MT9V03X_W / 2.0f - cx_dist) * 0.3f;
+
+        if(prev_cx >= 0)
+        {
+            float dx = (float)(blobs[i].cx - prev_cx);
+            float dy = (float)(blobs[i].cy - prev_cy);
+            score += (200.0f - (dx * dx + dy * dy)) * 0.2f;
+        }
+
+        if(!found || score > best_score)
+        {
+            found = 1;
+            best_score = score;
+            best = i;
+        }
+    }
+
+    debug_blob_cnt = blob_cnt;
+    debug_beacon_score = found ? best_score : 0.0f;
+
+    if(found)
+    {
+        float u_corr;
+        float v_corr;
+
+        info->status = BEACON_FOUND;
+        info->area = blobs[best].area;
+        info->sum = (int)(blobs[best].brightness * blobs[best].area);
+        beacon_lost_cnt = 0;
+        debug_beacon_lost = 0;
+
+        if(filt_cx < 0)
+        {
+            filt_cx = blobs[best].cx;
+            filt_cy = blobs[best].cy;
+        }
+        else
+        {
+            filt_cx = (int16_t)(filt_cx * (1.0f - BEACON_EMA_ALPHA) +
+                                blobs[best].cx * BEACON_EMA_ALPHA + 0.5f);
+            filt_cy = (int16_t)(filt_cy * (1.0f - BEACON_EMA_ALPHA) +
+                                blobs[best].cy * BEACON_EMA_ALPHA + 0.5f);
+        }
+
+        info->centerX = filt_cx;
+        info->centerY = filt_cy;
+        prev_cx = filt_cx;
+        prev_cy = filt_cy;
+
+        vision_attitude_compensation((float)info->centerX, (float)info->centerY,
+                                     &u_corr, &v_corr);
+        beacon_corr_x = u_corr;
+        beacon_corr_y = v_corr;
+        image_point_to_body_offset(beacon_corr_x, beacon_corr_y,
+                                   &beacon_body_x, &beacon_body_y);
+
+        erro = 1.0f * (MT9V03X_W / 2 - u_corr);
+        last_erro = erro;
+        erro_yawan = erro;
+        return;
+    }
+
+    if(beacon_lost_cnt < BEACON_LOST_SEARCH)
+    {
+        beacon_lost_cnt++;
+        erro = last_erro;
+    }
+    else
+    {
+        if(ABS(last_erro) < 30)
+            erro = (last_erro >= 0 ? 1 : -1) * 65.0f;
+        else
+            erro = last_erro;
+    }
+
+    debug_beacon_lost = beacon_lost_cnt;
+    erro_yawan = erro;
+}
+
+static uint8_t ycar_label_gray(const image_t *img,
+                               uint16_t area_table[],
+                               int min_x[], int max_x[],
+                               int min_y[], int max_y[])
+{
+    uint8_t parent[128];
+    uint8_t next_label = 1;
+    uint8_t label_map[128] = {0};
+    uint8_t component_cnt = 0;
+
+    memset(label_buf, 0, sizeof(label_buf));
+    memset(area_table, 0, sizeof(uint16_t) * 128);
+    for(uint8_t i = 0; i < 128; i++)
+    {
+        parent[i] = i;
+        min_x[i] = img->width;
+        max_x[i] = 0;
+        min_y[i] = img->height;
+        max_y[i] = 0;
+    }
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            if(AT_IMAGE(img, x, y) < CAR_IR_THRESHOLD) continue;
+
+            uint8_t best = 0;
+            uint8_t n;
+
+            if(x > 0)
+            {
+                n = label_buf[y][x - 1];
+                if(n != 0) best = n;
+            }
+            if(y > 0)
+            {
+                n = label_buf[y - 1][x];
+                if(n != 0 && (best == 0 || n < best)) best = n;
+            }
+            if(x > 0 && y > 0)
+            {
+                n = label_buf[y - 1][x - 1];
+                if(n != 0 && (best == 0 || n < best)) best = n;
+            }
+            if((x + 1) < img->width && y > 0)
+            {
+                n = label_buf[y - 1][x + 1];
+                if(n != 0 && (best == 0 || n < best)) best = n;
+            }
+
+            if(best == 0)
+            {
+                if(next_label >= 128) continue;
+                best = next_label++;
+            }
+
+            label_buf[y][x] = best;
+
+            if(x > 0)
+            {
+                n = label_buf[y][x - 1];
+                if(n != 0) label_union(parent, best, n);
+            }
+            if(y > 0)
+            {
+                n = label_buf[y - 1][x];
+                if(n != 0) label_union(parent, best, n);
+            }
+            if(x > 0 && y > 0)
+            {
+                n = label_buf[y - 1][x - 1];
+                if(n != 0) label_union(parent, best, n);
+            }
+            if((x + 1) < img->width && y > 0)
+            {
+                n = label_buf[y - 1][x + 1];
+                if(n != 0) label_union(parent, best, n);
+            }
+        }
+    }
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            uint8_t label = label_buf[y][x];
+            if(label == 0) continue;
+
+            label = label_find(parent, label);
+            if(label_map[label] == 0)
+            {
+                if(component_cnt >= 127) continue;
+                label_map[label] = ++component_cnt;
+            }
+
+            uint8_t id = label_map[label];
+            label_buf[y][x] = id;
+            area_table[id]++;
+            if(x < min_x[id]) min_x[id] = x;
+            if(x > max_x[id]) max_x[id] = x;
+            if(y < min_y[id]) min_y[id] = y;
+            if(y > max_y[id]) max_y[id] = y;
+        }
+    }
+
+    return component_cnt;
+}
+
+static uint8_t ycar_blob_is_near(const int minx[], const int maxx[],
+                                 const int miny[], const int maxy[],
+                                 uint8_t i, uint8_t j, int gap)
+{
+    int dx = (minx[i] > maxx[j]) ? (minx[i] - maxx[j])
+           : (minx[j] > maxx[i]) ? (minx[j] - maxx[i]) : 0;
+    int dy = (miny[i] > maxy[j]) ? (miny[i] - maxy[j])
+           : (miny[j] > maxy[i]) ? (miny[j] - maxy[i]) : 0;
+    return (dx <= gap && dy <= gap);
+}
+
+void ycar_detect_from_ir_blobs(const image_t *img, const IrBlob_t blobs[], uint8_t blob_cnt, YCarInfo_t *info)
+{
+    uint8_t keep[128];
+    uint8_t best_keep[128];
+    uint16_t best_score = 0;
+    int32_t total_pixels = 0;
+    int32_t sum_x = 0;
+    int32_t sum_y = 0;
+    int bb_min_x = img->width;
+    int bb_max_x = 0;
+    int bb_min_y = img->height;
+    int bb_max_y = 0;
+
+    info->valid = 0;
+    info->cx = 0;
+    info->cy = 0;
+    info->hx = 0.0f;
+    info->hy = 0.0f;
+
+    memset(best_keep, 0, sizeof(best_keep));
+
+    for(uint8_t seed = 0; seed < blob_cnt; seed++)
+    {
+        uint8_t tmp_keep[128];
+        int tmp_min_x = img->width;
+        int tmp_max_x = 0;
+        int tmp_min_y = img->height;
+        int tmp_max_y = 0;
+        uint16_t tmp_area = 0;
+
+        if(!blobs[seed].valid) continue;
+        if(blobs[seed].area < CAR_BLOB_MIN_AREA) continue;
+
+        memset(tmp_keep, 0, sizeof(tmp_keep));
+        tmp_keep[blobs[seed].label] = 1;
+
+        for(int changed = 1; changed; )
+        {
+            changed = 0;
+            for(uint8_t i = 0; i < blob_cnt; i++)
+            {
+                if(!blobs[i].valid) continue;
+                if(tmp_keep[blobs[i].label] || blobs[i].area < CAR_BLOB_MIN_AREA) continue;
+
+                for(uint8_t j = 0; j < blob_cnt; j++)
+                {
+                    if(!blobs[j].valid) continue;
+                    if(!tmp_keep[blobs[j].label]) continue;
+
+                    int dx = (blobs[i].min_x > blobs[j].max_x) ? (blobs[i].min_x - blobs[j].max_x)
+                           : (blobs[j].min_x > blobs[i].max_x) ? (blobs[j].min_x - blobs[i].max_x) : 0;
+                    int dy = (blobs[i].min_y > blobs[j].max_y) ? (blobs[i].min_y - blobs[j].max_y)
+                           : (blobs[j].min_y > blobs[i].max_y) ? (blobs[j].min_y - blobs[i].max_y) : 0;
+
+                    if(dx <= CAR_BLOB_MERGE_GAP && dy <= CAR_BLOB_MERGE_GAP)
+                    {
+                        tmp_keep[blobs[i].label] = 1;
+                        changed = 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for(uint8_t i = 0; i < blob_cnt; i++)
+        {
+            if(!blobs[i].valid || !tmp_keep[blobs[i].label]) continue;
+            tmp_area += blobs[i].area;
+            if(blobs[i].min_x < tmp_min_x) tmp_min_x = blobs[i].min_x;
+            if(blobs[i].max_x > tmp_max_x) tmp_max_x = blobs[i].max_x;
+            if(blobs[i].min_y < tmp_min_y) tmp_min_y = blobs[i].min_y;
+            if(blobs[i].max_y > tmp_max_y) tmp_max_y = blobs[i].max_y;
+        }
+
+        if(tmp_area >= CAR_MIN_PIX && tmp_area <= CAR_MAX_PIX)
+        {
+            int bw = tmp_max_x - tmp_min_x + 1;
+            int bh = tmp_max_y - tmp_min_y + 1;
+            float ratio;
+
+            if(bw <= 0 || bh <= 0) continue;
+            ratio = (bw > bh) ? ((float)bw / (float)bh) : ((float)bh / (float)bw);
+            if(ratio < CAR_ASPECT_MIN || ratio > CAR_ASPECT_MAX) continue;
+
+            if(tmp_area > best_score)
+            {
+                best_score = tmp_area;
+                memcpy(best_keep, tmp_keep, sizeof(best_keep));
+            }
+        }
+    }
+
+    if(best_score == 0) return;
+    memcpy(keep, best_keep, sizeof(keep));
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            uint8_t lbl = label_buf[y][x];
+            if(lbl != 0 && keep[lbl])
+            {
+                sum_x += x;
+                sum_y += y;
+                total_pixels++;
+                if(x < bb_min_x) bb_min_x = x;
+                if(x > bb_max_x) bb_max_x = x;
+                if(y < bb_min_y) bb_min_y = y;
+                if(y > bb_max_y) bb_max_y = y;
+            }
+        }
+    }
+
+    if(total_pixels < CAR_MIN_PIX || total_pixels > CAR_MAX_PIX) return;
+
+    float mx = (float)sum_x / (float)total_pixels;
+    float my = (float)sum_y / (float)total_pixels;
+    float cxx = 0.0f;
+    float cyy = 0.0f;
+    float cxy = 0.0f;
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            uint8_t lbl = label_buf[y][x];
+            if(lbl == 0 || !keep[lbl]) continue;
+
+            float dx = (float)x - mx;
+            float dy = (float)y - my;
+            cxx += dx * dx;
+            cyy += dy * dy;
+            cxy += dx * dy;
+        }
+    }
+
+    cxx /= (float)total_pixels;
+    cyy /= (float)total_pixels;
+    cxy /= (float)total_pixels;
+
+    float e1x;
+    float e1y;
+    if(fabsf(cxy) < 0.5f)
+    {
+        if(cxx >= cyy) { e1x = 1.0f; e1y = 0.0f; }
+        else           { e1x = 0.0f; e1y = 1.0f; }
+    }
+    else
+    {
+        float d = (cxx - cyy) * 0.5f;
+        float r = sqrtf(d * d + cxy * cxy);
+        float nx = cxy;
+        float ny = r - d;
+        float norm = sqrtf(nx * nx + ny * ny);
+        if(norm < 1e-8f) return;
+        e1x = nx / norm;
+        e1y = ny / norm;
+    }
+
+    float e2x = -e1y;
+    float e2y = e1x;
+    float p1_pos_max = -1e9f;
+    float p1_pos_min = 1e9f;
+    float p1_neg_max = -1e9f;
+    float p1_neg_min = 1e9f;
+    int cnt_pos = 0;
+    int cnt_neg = 0;
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            uint8_t lbl = label_buf[y][x];
+            if(lbl == 0 || !keep[lbl]) continue;
+
+            float dx = (float)x - mx;
+            float dy = (float)y - my;
+            float p1 = dx * e1x + dy * e1y;
+            float p2 = dx * e2x + dy * e2y;
+
+            if(p2 >= 0.0f)
+            {
+                if(p1 > p1_pos_max) p1_pos_max = p1;
+                if(p1 < p1_pos_min) p1_pos_min = p1;
+                cnt_pos++;
+            }
+            else
+            {
+                if(p1 > p1_neg_max) p1_neg_max = p1;
+                if(p1 < p1_neg_min) p1_neg_min = p1;
+                cnt_neg++;
+            }
+        }
+    }
+
+    float w_pos = (cnt_pos > 1) ? (p1_pos_max - p1_pos_min) : 0.0f;
+    float w_neg = (cnt_neg > 1) ? (p1_neg_max - p1_neg_min) : 0.0f;
+    float w_small = (w_pos < w_neg) ? w_pos : w_neg;
+    float w_large = (w_pos > w_neg) ? w_pos : w_neg;
+    float w_ratio = (w_small > 0.1f) ? (w_large / w_small) : 999.0f;
+    float hx;
+    float hy;
+
+    if(w_ratio < CAR_W_RATIO_MIN) return;
+
+    if(w_pos >= w_neg)
+    {
+        hx = -e2x;
+        hy = -e2y;
+    }
+    else
+    {
+        hx = e2x;
+        hy = e2y;
+    }
+
+    {
+        static float filt_hx = 0.0f;
+        static float filt_hy = 0.0f;
+        static uint8_t ema_init = 0;
+
+        if(!ema_init)
+        {
+            filt_hx = hx;
+            filt_hy = hy;
+            ema_init = 1;
+        }
+        else
+        {
+            float dot = filt_hx * hx + filt_hy * hy;
+            if(dot < 0.0f)
+            {
+                hx = -hx;
+                hy = -hy;
+            }
+
+            filt_hx = filt_hx * (1.0f - CAR_DIR_EMA_ALPHA) + hx * CAR_DIR_EMA_ALPHA;
+            filt_hy = filt_hy * (1.0f - CAR_DIR_EMA_ALPHA) + hy * CAR_DIR_EMA_ALPHA;
+
+            float norm = sqrtf(filt_hx * filt_hx + filt_hy * filt_hy);
+            if(norm > 1e-6f)
+            {
+                filt_hx /= norm;
+                filt_hy /= norm;
+            }
+        }
+
+        hx = filt_hx;
+        hy = filt_hy;
+    }
+
+    info->cx = (int16_t)(mx + 0.5f);
+    info->cy = (int16_t)(my + 0.5f);
+    info->hx = hx;
+    info->hy = hy;
+    info->valid = 1;
+}
+
+void ycar_detect_gray(const image_t *img, YCarInfo_t *info)
+{
+    uint16_t area_tbl[128];
+    int minx[128], maxx[128], miny[128], maxy[128];
+    uint8_t keep[128];
+    uint8_t labels;
+    uint8_t best_keep[128];
+    uint16_t best_score = 0;
+    int32_t total_pixels = 0;
+    int32_t sum_x = 0;
+    int32_t sum_y = 0;
+    int bb_min_x = img->width;
+    int bb_max_x = 0;
+    int bb_min_y = img->height;
+    int bb_max_y = 0;
+
+    info->valid = 0;
+    info->cx = 0;
+    info->cy = 0;
+    info->hx = 0.0f;
+    info->hy = 0.0f;
+
+    labels = ycar_label_gray(img, area_tbl, minx, maxx, miny, maxy);
+    if(labels == 0) return;
+
+    memset(best_keep, 0, sizeof(best_keep));
+
+    for(uint8_t seed = 1; seed <= labels; seed++)
+    {
+        uint8_t tmp_keep[128];
+        int tmp_min_x = img->width;
+        int tmp_max_x = 0;
+        int tmp_min_y = img->height;
+        int tmp_max_y = 0;
+        uint16_t tmp_area = 0;
+
+        if(area_tbl[seed] < CAR_BLOB_MIN_AREA) continue;
+
+        memset(tmp_keep, 0, sizeof(tmp_keep));
+        tmp_keep[seed] = 1;
+
+        for(int changed = 1; changed; )
+        {
+            changed = 0;
+            for(uint8_t i = 1; i <= labels; i++)
+            {
+                if(tmp_keep[i] || area_tbl[i] < CAR_BLOB_MIN_AREA) continue;
+                for(uint8_t j = 1; j <= labels; j++)
+                {
+                    if(!tmp_keep[j]) continue;
+                    if(ycar_blob_is_near(minx, maxx, miny, maxy, i, j, CAR_BLOB_MERGE_GAP))
+                    {
+                        tmp_keep[i] = 1;
+                        changed = 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for(uint8_t i = 1; i <= labels; i++)
+        {
+            if(!tmp_keep[i]) continue;
+            tmp_area += area_tbl[i];
+            if(minx[i] < tmp_min_x) tmp_min_x = minx[i];
+            if(maxx[i] > tmp_max_x) tmp_max_x = maxx[i];
+            if(miny[i] < tmp_min_y) tmp_min_y = miny[i];
+            if(maxy[i] > tmp_max_y) tmp_max_y = maxy[i];
+        }
+
+        if(tmp_area >= CAR_MIN_PIX && tmp_area <= CAR_MAX_PIX)
+        {
+            int bw = tmp_max_x - tmp_min_x + 1;
+            int bh = tmp_max_y - tmp_min_y + 1;
+            float ratio;
+
+            if(bw <= 0 || bh <= 0) continue;
+            ratio = (bw > bh) ? ((float)bw / (float)bh) : ((float)bh / (float)bw);
+            if(ratio < CAR_ASPECT_MIN || ratio > CAR_ASPECT_MAX) continue;
+
+            if(tmp_area > best_score)
+            {
+                best_score = tmp_area;
+                memcpy(best_keep, tmp_keep, sizeof(best_keep));
+            }
+        }
+    }
+
+    if(best_score == 0) return;
+    memcpy(keep, best_keep, sizeof(keep));
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            uint8_t lbl = label_buf[y][x];
+            if(lbl != 0 && keep[lbl])
+            {
+                sum_x += x;
+                sum_y += y;
+                total_pixels++;
+                if(x < bb_min_x) bb_min_x = x;
+                if(x > bb_max_x) bb_max_x = x;
+                if(y < bb_min_y) bb_min_y = y;
+                if(y > bb_max_y) bb_max_y = y;
+            }
+        }
+    }
+
+    if(total_pixels < CAR_MIN_PIX || total_pixels > CAR_MAX_PIX) return;
+
+    {
+        int bw = bb_max_x - bb_min_x + 1;
+        int bh = bb_max_y - bb_min_y + 1;
+        if(bw <= 0 || bh <= 0) return;
+
+        float ratio = (bw > bh) ? ((float)bw / (float)bh) : ((float)bh / (float)bw);
+        if(ratio < CAR_ASPECT_MIN || ratio > CAR_ASPECT_MAX) return;
+    }
+
+    float mx = (float)sum_x / (float)total_pixels;
+    float my = (float)sum_y / (float)total_pixels;
+    float cxx = 0.0f;
+    float cyy = 0.0f;
+    float cxy = 0.0f;
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            uint8_t lbl = label_buf[y][x];
+            if(lbl == 0 || !keep[lbl]) continue;
+
+            float dx = (float)x - mx;
+            float dy = (float)y - my;
+            cxx += dx * dx;
+            cyy += dy * dy;
+            cxy += dx * dy;
+        }
+    }
+
+    cxx /= (float)total_pixels;
+    cyy /= (float)total_pixels;
+    cxy /= (float)total_pixels;
+
+    float e1x;
+    float e1y;
+    if(fabsf(cxy) < 0.5f)
+    {
+        if(cxx >= cyy)
+        {
+            e1x = 1.0f;
+            e1y = 0.0f;
+        }
+        else
+        {
+            e1x = 0.0f;
+            e1y = 1.0f;
+        }
+    }
+    else
+    {
+        float d = (cxx - cyy) * 0.5f;
+        float r = sqrtf(d * d + cxy * cxy);
+        float nx = cxy;
+        float ny = r - d;
+        float norm = sqrtf(nx * nx + ny * ny);
+        if(norm < 1e-8f) return;
+        e1x = nx / norm;
+        e1y = ny / norm;
+    }
+
+    float e2x = -e1y;
+    float e2y = e1x;
+    float p1_pos_max = -1e9f;
+    float p1_pos_min = 1e9f;
+    float p1_neg_max = -1e9f;
+    float p1_neg_min = 1e9f;
+    int cnt_pos = 0;
+    int cnt_neg = 0;
+
+    for(int y = 0; y < img->height; y++)
+    {
+        for(int x = 0; x < img->width; x++)
+        {
+            uint8_t lbl = label_buf[y][x];
+            if(lbl == 0 || !keep[lbl]) continue;
+
+            float dx = (float)x - mx;
+            float dy = (float)y - my;
+            float p1 = dx * e1x + dy * e1y;
+            float p2 = dx * e2x + dy * e2y;
+
+            if(p2 >= 0.0f)
+            {
+                if(p1 > p1_pos_max) p1_pos_max = p1;
+                if(p1 < p1_pos_min) p1_pos_min = p1;
+                cnt_pos++;
+            }
+            else
+            {
+                if(p1 > p1_neg_max) p1_neg_max = p1;
+                if(p1 < p1_neg_min) p1_neg_min = p1;
+                cnt_neg++;
+            }
+        }
+    }
+
+    float w_pos = (cnt_pos > 1) ? (p1_pos_max - p1_pos_min) : 0.0f;
+    float w_neg = (cnt_neg > 1) ? (p1_neg_max - p1_neg_min) : 0.0f;
+    float w_small = (w_pos < w_neg) ? w_pos : w_neg;
+    float w_large = (w_pos > w_neg) ? w_pos : w_neg;
+    float w_ratio = (w_small > 0.1f) ? (w_large / w_small) : 999.0f;
+    float hx;
+    float hy;
+
+    if(w_ratio < CAR_W_RATIO_MIN) return;
+
+    if(w_pos >= w_neg)
+    {
+        hx = -e2x;
+        hy = -e2y;
+    }
+    else
+    {
+        hx = e2x;
+        hy = e2y;
+    }
+
+    {
+        static float filt_hx = 0.0f;
+        static float filt_hy = 0.0f;
+        static uint8_t ema_init = 0;
+
+        if(!ema_init)
+        {
+            filt_hx = hx;
+            filt_hy = hy;
+            ema_init = 1;
+        }
+        else
+        {
+            float dot = filt_hx * hx + filt_hy * hy;
+            if(dot < 0.0f)
+            {
+                hx = -hx;
+                hy = -hy;
+            }
+
+            filt_hx = filt_hx * (1.0f - CAR_DIR_EMA_ALPHA) + hx * CAR_DIR_EMA_ALPHA;
+            filt_hy = filt_hy * (1.0f - CAR_DIR_EMA_ALPHA) + hy * CAR_DIR_EMA_ALPHA;
+
+            float norm = sqrtf(filt_hx * filt_hx + filt_hy * filt_hy);
+            if(norm > 1e-6f)
+            {
+                filt_hx /= norm;
+                filt_hy /= norm;
+            }
+        }
+
+        hx = filt_hx;
+        hy = filt_hy;
+    }
+
+    info->cx = (int16_t)(mx + 0.5f);
+    info->cy = (int16_t)(my + 0.5f);
+    info->hx = hx;
+    info->hy = hy;
+    info->valid = 1;
+}
+
 // ###########################################################################
 // 函数名称: detect_beacon
 // 函数功能: 从图像中检测信标（红外光源）
-// 参数说明: 
+// 参数说明:
 //           img  - 摄像头图像指针
 //           info - 信标信息输出结构指针
 // 返回说明: 无
 // ###########################################################################
 void detect_beacon(image_t *img, BeaconInfo *info)
 {
-    int16_t sumvalue = 0;   // 当前区域像素总和
-    int16_t value = 0;      // 临时变量
-    int temp = 0;          // 交换用临时变量
-
-    // ======================= 初始化信标信息 =======================
-    info->status = BEACON_NOT_FOUND;   // 默认未找到
-    info->centerX = 0;                // 信标中心X坐标
-    info->centerY = 0;                // 信标中心Y坐标
-    info->length = 0;                 // 当前长度（距图像中心距离）
-    info->length_last = 0;           // 上一次长度
-    info->area = 0;                   // 面积
-    info->last_centerX = 0;          // 上一次中心X
-    info->last_centerY = 0;          // 上一次中心Y
-    info->sum_last = 0;               // 上一次像素总和
-    info->sum = 0;                   // 当前像素总和
-    info->quanzhong = 0;              // 权重（用于筛选最佳候选点）
-    info->last_quanzhong = 0;         // 上一次权重
-
-    // ======================= 扫描图像寻找信标 =======================
-    // 扫描范围：Y从39到图像高度-10，X从10到图像宽度-10
-    // 跳过边缘区域，减少误检测
-    for(int y = 39; y < MT9V03X_H - 10; y++)
-    {
-        for(int x = 10; x < MT9V03X_W - 10; x++)
-        {
-            // 判断当前像素是否超过红外阈值（可能是信标）
-            if(AT_IMAGE(img, x, y) > IR_THRESHOLD)
-            {
-                // 在10x10邻域内求和（检测亮点区域）
-                for(int i = 0; i < 10; i++)
-                    for(int j = 0; j < 10; j++)
-                    {
-                        value += AT_IMAGE(img, x - j, y - j);
-                    }
-
-                // ======================= 寻找最亮区域 =======================
-                if(value > sumvalue)
-                {
-                    // 如果新点比当前最佳点更亮，且与上次检测点有足够距离
-                    if(func_abs(y - info->centerY) > 20)
-                    {
-                        // 保存当前最佳点作为"上一次最佳点"
-                        info->sum_last = sumvalue;
-                        info->last_centerX = info->centerX;
-                        info->last_centerY = info->centerY;
-                    }
-
-                    // 更新最佳点
-                    sumvalue = value;
-                    info->sum = sumvalue;
-                    info->centerX = x;
-                    info->centerY = y;
-                    value = 0;
-                }
-                // 备选点：较亮但不是最亮的点
-                else if(value > info->sum_last && ABS(y - info->last_centerY) > 20)
-                {
-                    info->sum_last = value;
-                    info->last_centerX = x;
-                    info->last_centerY = y;
-                }
-                else 
-                {
-                    value = 0;  // 重置
-                }
-            }
-        }
-    } // <-- 必须在这里先结束 Y 轴的循环！等全图扫描完了再进行一次性的权重比较
-
-    // ======================= 扫描结束后，计算权重并挑选最优解 =======================
-    if(info->centerX != 0)
-    {
-        info->status = BEACON_FOUND;
-        
-        // 如果找到了备用候选点，比较主备两点的实际综合权重
-        if(info->last_centerX != 0)
-        {
-            // 权重计算：优先选择下方(离飞机近)且靠近画面中心，同时参考总亮度
-            float weight1 = 2.0f * info->sum      + 6.5f * func_abs(MT9V03X_H - info->centerY)      - 1.5f * func_abs(MT9V03X_W / 2 - info->centerX);
-            float weight2 = 2.0f * info->sum_last + 6.5f * func_abs(MT9V03X_H - info->last_centerY) - 1.5f * func_abs(MT9V03X_W / 2 - info->last_centerX);
-
-            // 如果备用点的权重更高，执行"篡位"交换，让备用点成为最终输出
-            if(weight2 > weight1)
-            {
-                temp = info->sum;      info->sum = info->sum_last;           info->sum_last = temp;
-                temp = info->centerX;  info->centerX = info->last_centerX;   info->last_centerX = temp;
-                temp = info->centerY;  info->centerY = info->last_centerY;   info->last_centerY = temp;
-            }
-        }
-    }
-
-    // ======================= 计算最终误差 =======================
-    last_erro = erro;
-    erro = 1.0f * (MT9V03X_W / 2 - info->centerX);  // X方向误差
-
-    if(info->status == BEACON_NOT_FOUND)
-    {
-        if(last_erro < 30)
-        {
-            // 如果刚跟丢，保持转动趋势(防丢失盲转打角)
-            erro = (last_erro >= 0 ? 1 : -1) * 65.0f;  
-        }
-        else
-        {
-            erro = last_erro;  // 保持上次误差
-        }
-    }
-
-    erro_yawan = erro;  // 同步偏航误差
+    IrBlob_t blobs[MAX_IR_BLOBS];
+    uint8_t blob_cnt = ir_find_blobs_gray(img, blobs, MAX_IR_BLOBS);
+    classify_ir_blobs(blobs, blob_cnt);
+    detect_beacon_from_ir_blobs(blobs, blob_cnt, info);
 }
 
 bool visited[MT9V03X_H][MT9V03X_W] = {false};
@@ -303,82 +1254,130 @@ void vision_attitude_compensation(float u_raw, float v_raw, float *u_corr, float
     *v_corr = IMAGE_CENTER_Y + CAMERA_FOCAL_LENGTH_PIXEL * (Yg / Zg);
 }
 
-// --- 整图姿态解耦函数 (全图逆映射) ---
-// 将整个带倾斜的图像，重新投影为"虚拟水平相机"所看到的视角
-// 仅供前期测试使用，因为全像素的浮点运算非常耗时！
-void image_attitude_compensation(const image_t *img_src, image_t *img_dst)
-{
-    float cr = vehicle_state.roll_cos;
-    float sr = vehicle_state.roll_sin;
-    float cp = vehicle_state.pitch_cos;
-    float sp = vehicle_state.pitch_sin;
-
-    // 1. 清空目标图像，防止边缘出现上一次的残影
-    memset(img_dst->data, 0, img_dst->height * img_dst->step);
-
-    // 2. 逆映射遍历：遍历目标图像（虚拟水平相机）的每一个像素
-    for (int y = 0; y < img_dst->height; y++)
-    {
-        for (int x = 0; x < img_dst->width; x++)
-        {
-            // 将目标图像像素坐标转化为 3D 射线 (Pg)
-            float Xg = (float)x - IMAGE_CENTER_X;
-            float Yg = (float)y - IMAGE_CENTER_Y;
-            float Zg = CAMERA_FOCAL_LENGTH_PIXEL;
-
-            // 乘以逆旋转矩阵 R^T，反推原始倾斜相机下的 3D 射线 (Pc)
-            float Xc =  Xg * cp * cr + Yg * sr - Zg * sp * cr;
-            float Yc = -Xg * cp * sr + Yg * cr + Zg * sp * sr;
-            float Zc =  Xg * sp      + 0.0f    + Zg * cp;
-
-            if (Zc < 0.001f) {
-                continue; // 射线在相机后方，不可见
-            }
-
-            // 投影回原始倾斜相机的 2D 像素平面
-            int u_src = (int)(IMAGE_CENTER_X + CAMERA_FOCAL_LENGTH_PIXEL * (Xc / Zc));
-            int v_src = (int)(IMAGE_CENTER_Y + CAMERA_FOCAL_LENGTH_PIXEL * (Yc / Zc));
-
-            // 如果反推出来的像素在原图范围内，则进行色彩赋值
-            if (u_src >= 0 && u_src < img_src->width && v_src >= 0 && v_src < img_src->height)
-            {
-                AT_IMAGE(img_dst, x, y) = AT_IMAGE(img_src, u_src, v_src);
-            }
-        }
-    }
-}
-
 uint8_t image_process()
 {
+    IrBlob_t ir_blobs[MAX_IR_BLOBS];
+    YCarInfo_t ycar_frame;
+    mcar_guidance_t mcar_guidance;
+    uint8_t ir_blob_cnt;
+
     memcpy(base_image, mt9v03x_image, MT9V03X_IMAGE_SIZE); // 将采集到的图像数据复制到 base_image 中
-    uint8_t threshold = fast_threshold(base_image[0], MT9V03X_W, MT9V03X_H); // 计算 OTSU 阈值
-    threshold_fixed(&base_img, &binary_img, threshold, 0, 255); // 二值化处理
-    image_erode3(&binary_img, &decoupled_img); // 腐蚀去噪
-    image_dilate3(&decoupled_img, &binary_img); // 膨胀恢复目标大小
     image_remap8(&base_img, &undistorted_img, &mapx_img, &mapy_img); // 去畸变重映射
-    detect_beacon(&undistorted_img, &beacon); // 寻找信标
+
+    ir_blob_cnt = ir_find_blobs_gray(&undistorted_img, ir_blobs, MAX_IR_BLOBS);
+    classify_ir_blobs(ir_blobs, ir_blob_cnt);
+
+    detect_beacon_from_ir_blobs(ir_blobs, ir_blob_cnt, &beacon);
+    ycar_detect_from_ir_blobs(&undistorted_img, ir_blobs, ir_blob_cnt, &ycar_frame);
+
+        if (ycar_frame.valid)
+        {
+            float mcar_corr_x;
+            float mcar_corr_y;
+            float mcar_head_corr_x;
+            float mcar_head_corr_y;
+
+            ycar_info = ycar_frame;
+            ycar_lost_cnt = 0;
+            debug_ycar_lost = 0;
+            debug_ycar_angle = atan2f(ycar_info.hy, ycar_info.hx) * 57.29578f;
+            vision_attitude_compensation((float)ycar_info.cx, (float)ycar_info.cy,
+                                         &mcar_corr_x, &mcar_corr_y);
+            vision_attitude_compensation((float)ycar_info.cx + ycar_info.hx * 16.0f,
+                                         (float)ycar_info.cy + ycar_info.hy * 16.0f,
+                                         &mcar_head_corr_x, &mcar_head_corr_y);
+            image_point_to_body_offset(mcar_corr_x, mcar_corr_y,
+                                       &ycar_body_x, &ycar_body_y);
+            image_vector_to_body_vector(mcar_head_corr_x - mcar_corr_x,
+                                        mcar_head_corr_y - mcar_corr_y,
+                                        &ycar_head_body_x, &ycar_head_body_y);
+            draw_o(&undistorted_img, ycar_info.cx, ycar_info.cy, 4, 180);
+            draw_line(&undistorted_img,
+                      (float)ycar_info.cx,
+                      (float)ycar_info.cy,
+                      (float)ycar_info.cx + ycar_info.hx * 16.0f,
+                      (float)ycar_info.cy + ycar_info.hy * 16.0f,
+                      180);
+            {
+                static uint32_t last_ycar_print_time = 0;
+                if(system_time_us() - last_ycar_print_time > 100000)
+                {
+                    last_ycar_print_time = system_time_us();
+                    printf("YCAR: img(%3d,%3d) body(%6.1f,%6.1f) head_body(%5.2f,%5.2f) angle=%.1f\n",
+                           ycar_info.cx, ycar_info.cy,
+                           ycar_body_x, ycar_body_y,
+                           ycar_head_body_x, ycar_head_body_y,
+                           debug_ycar_angle);
+                }
+            }
+        }
+        else
+        {
+            if(ycar_lost_cnt < 255) ycar_lost_cnt++;
+            debug_ycar_lost = ycar_lost_cnt;
+            if(ycar_lost_cnt > YCAR_LOST_HOLD)
+            {
+                ycar_info.valid = 0;
+            }
+        }
 
         // 3. 如果找到了信标点，进行解耦和标记
         if (beacon.status == BEACON_FOUND)
         {
             int u_raw = beacon.centerX;
             int v_raw = beacon.centerY;
-            float u_corrected, v_corrected;
-            
-            // 核心：调用姿态解耦函数，传入当前飞机的Roll/Pitch，得到纠正后的虚拟坐标
-            vision_attitude_compensation((float)u_raw, (float)v_raw, &u_corrected, &v_corrected);
 
             // 周期性通过串口打印，避免刷屏太快看不清
+#if !BEACON_CAL_DEBUG_ENABLE
             static uint32_t last_vision_print_time = 0;
             if(system_time_us() - last_vision_print_time > 100000) {
                 last_vision_print_time = system_time_us();
-                printf("Raw: (%3d, %3d) | Att(R,P): (%6.1f, %6.1f) | Corr: (%6.1f, %6.1f)\n",
-                       u_raw, v_raw, vehicle_state.current_roll, vehicle_state.current_pitch, u_corrected, v_corrected);
+                printf("Beacon: raw(%3d,%3d) corr(%6.1f,%6.1f) body(%6.1f,%6.1f) area=%u blobs=%u score=%.1f\n",
+                       u_raw, v_raw, beacon_corr_x, beacon_corr_y,
+                       beacon_body_x, beacon_body_y,
+                       beacon.area, debug_blob_cnt, debug_beacon_score);
             }
+#endif
             // 在屏幕画面上画上标记，方便肉眼确认抓没抓对点
             draw_x(&undistorted_img, u_raw, v_raw, 5, 255);                       // 原始坐标画个白色的 'X'
-            draw_o(&undistorted_img, (int)u_corrected, (int)v_corrected, 6, 128); // 解耦坐标画个灰色的 'O'
+            draw_o(&undistorted_img, (int)beacon_corr_x, (int)beacon_corr_y, 6, 128); // 解耦坐标画个灰色的 'O'
         }
+
+    beacon_calibration_log();
+
+    mcar_guidance.valid = 0u;
+    if(beacon.status == BEACON_FOUND && ycar_info.valid)
+    {
+        mcar_guidance = mcar_guidance_calculate(beacon_body_x, beacon_body_y,
+                                                ycar_body_x, ycar_body_y,
+                                                ycar_head_body_x, ycar_head_body_y,
+                                                imu_data.yaw);
+    }
+
+    if(mcar_guidance.valid)
+    {
+        uint8 flags = MCAR_COMM_FLAG_BEACON_VALID |
+                      MCAR_COMM_FLAG_MCAR_VALID |
+                      MCAR_COMM_FLAG_YAW_VALID;
+        if(debug_beacon_lost != 0u || debug_ycar_lost != 0u)
+        {
+            flags |= MCAR_COMM_FLAG_OBS_HELD;
+        }
+
+        mcar_comm_send_target(mcar_guidance.err_forward_px,
+                              mcar_guidance.err_right_px,
+                              mcar_guidance.mcar_yaw_earth_cdeg,
+                              flags);
+    }
+    else
+    {
+        uint8 flags = 0u;
+        if(beacon.status == BEACON_FOUND) flags |= MCAR_COMM_FLAG_BEACON_VALID;
+        if(ycar_info.valid) flags |= MCAR_COMM_FLAG_MCAR_VALID;
+        mcar_comm_send_target(0, 0, 0, flags);
+    }
+
+    vision_nav_update();
 
     return 1;
 }

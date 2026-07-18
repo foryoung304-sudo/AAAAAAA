@@ -337,6 +337,12 @@ void alt_2level_ctrl(float dT_s)
                 AUTO_LAND_DESCEND_SPEED_CM_S :
                 ALT_TRAJ_MAX_DESCEND_CM_S;
 
+            if(((flight_sensor_failsafe_flags & PREFLIGHT_ERR_TOF) != 0u) &&
+               (vehicle_state.flight_mode == FLY_AUTOLANDING))
+            {
+                descend_limit = AUTO_LAND_TOF_FAILSAFE_DESCEND_SPEED_CM_S;
+            }
+
             
             remaining_before = final_height - alt_rt.alt_profile_height_cm;
             brake_speed = ctrl_brake_speed(ALT_TRAJ_ACCEL_CM_S2, remaining_before);

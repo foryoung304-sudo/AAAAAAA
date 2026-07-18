@@ -571,21 +571,39 @@ static float imu_last_acc_valid[3] = {0.0f, 0.0f, 1.0f};
 #define IMU_STATIC_GYRO_DPS       (0.12f)
 #define IMU_STATIC_ACC_ERR_G      (0.03f)
 
-static uint8 imu_raw_frame_is_valid(float gyro[3], float acc[3])
+static uint8 imu_gyro_frame_is_valid(const float gyro[3])
 {
-    float acc_norm = acc[0]*acc[0] + acc[1]*acc[1] + acc[2]*acc[2];
-
-    if(acc_norm < IMU_ACC_NORM_MIN_G || acc_norm > IMU_ACC_NORM_MAX_G) {
-        imu_raw_frame_ready = 0;
-        return 0;
-    }
-
     for(int i = 0; i < 3; i++) {
-        if(ABS(gyro[i]) > IMU_GYRO_ABS_MAX_DPS || ABS(acc[i]) > IMU_ACC_ABS_MAX_G) {
+        if(ABS(gyro[i]) > IMU_GYRO_ABS_MAX_DPS) {
             imu_raw_frame_ready = 0;
             return 0;
         }
     }
+
+    imu_raw_frame_ready = 1;
+    return 1;
+}
+
+static uint8 imu_acc_frame_is_valid(const float acc[3])
+{
+    float acc_norm = acc[0]*acc[0] + acc[1]*acc[1] + acc[2]*acc[2];
+
+    if((acc_norm < IMU_ACC_NORM_MIN_G) ||
+       (acc_norm > IMU_ACC_NORM_MAX_G)) {
+        return 0;
+    }
+
+    for(int i = 0; i < 3; i++) {
+        if(ABS(acc[i]) > IMU_ACC_ABS_MAX_G) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void imu_record_valid_frame(const float gyro[3], const float acc[3])
+{
 
     // spike 检测只用于计数/日志，不要直接卡死更新
     if(imu_raw_frame_ready) {
@@ -605,9 +623,6 @@ static uint8 imu_raw_frame_is_valid(float gyro[3], float acc[3])
         imu_last_gyro_valid[i] = gyro[i];
         imu_last_acc_valid[i] = acc[i];
     }
-
-    imu_raw_frame_ready = 1;
-    return 1;
 }
 void imu_get_gyro(int16_t *gyro_x, int16_t *gyro_y, int16_t *gyro_z)
 {
@@ -745,9 +760,24 @@ void imu_calc(void)
     float gyro_raw_frame[3] = {gyro_x, gyro_y, gyro_z};
     float acc_raw_frame[3] = {acc_x, acc_y, acc_z};
 
-    if(!imu_raw_frame_is_valid(gyro_raw_frame, acc_raw_frame)) {
+    if(!imu_gyro_frame_is_valid(gyro_raw_frame)) {
         imu_bad_frame_count++;
         return;
+    }
+
+    if(imu_acc_frame_is_valid(acc_raw_frame))
+    {
+        imu_record_valid_frame(gyro_raw_frame, acc_raw_frame);
+    }
+    else
+    {
+        /* Acceleration can be unreliable during a manoeuvre while the gyro
+         * still provides a usable attitude propagation signal.  Do not freeze
+         * the attitude loop or turn that transient into an IMU-loss failsafe. */
+        imu_bad_frame_count++;
+        acc_x = imu_last_acc_valid[0];
+        acc_y = imu_last_acc_valid[1];
+        acc_z = imu_last_acc_valid[2];
     }
     imu_last_valid_sample_us = current_time_us;
 
@@ -890,9 +920,8 @@ uint32 imu_get_bad_frame_count(void)
     return imu_bad_frame_count;
 }
 
-uint8 imu_is_valid(void)
+uint8 imu_attitude_is_valid(void)
 {
-    float acc_norm;
     float quat_norm;
     uint32 now_us;
 
@@ -908,14 +937,6 @@ uint8 imu_is_valid(void)
         return 0u;
     }
 
-    acc_norm = sqrt(imu_data.acc_actual[0] * imu_data.acc_actual[0] +
-                    imu_data.acc_actual[1] * imu_data.acc_actual[1] +
-                    imu_data.acc_actual[2] * imu_data.acc_actual[2]);
-    if((acc_norm < 0.5f) || (acc_norm > 2.0f))
-    {
-        return 0u;
-    }
-
     quat_norm = imu_data.quaternion[0] * imu_data.quaternion[0] +
                 imu_data.quaternion[1] * imu_data.quaternion[1] +
                 imu_data.quaternion[2] * imu_data.quaternion[2] +
@@ -926,6 +947,22 @@ uint8 imu_is_valid(void)
     }
 
     return 1u;
+}
+
+uint8 imu_is_valid(void)
+{
+    float acc_norm;
+
+    if(imu_attitude_is_valid() == 0u)
+    {
+        return 0u;
+    }
+
+    /* Keep the stricter acceleration sanity check for preflight only. */
+    acc_norm = sqrt(imu_data.acc_actual[0] * imu_data.acc_actual[0] +
+                    imu_data.acc_actual[1] * imu_data.acc_actual[1] +
+                    imu_data.acc_actual[2] * imu_data.acc_actual[2]);
+    return ((acc_norm >= 0.5f) && (acc_norm <= 2.0f)) ? 1u : 0u;
 }
 
 

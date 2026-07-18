@@ -121,10 +121,12 @@ typedef struct
     uint8_t pending;
     uint8_t reason_flags;
     uint8_t imu_valid;
+    uint8_t imu_attitude_valid;
     uint8_t tof_ok;
     uint8_t flow_valid;
     uint8_t flow_quality;
     uint32_t time_us;
+    uint32_t imu_bad_frame_count;
     uint32_t lc302_bytes;
     uint32_t lc302_frames;
     float voltage;
@@ -189,10 +191,12 @@ static void flight_capture_failsafe_snapshot(uint8_t reasons)
     flight_failsafe_snapshot.pending = 1u;
     flight_failsafe_snapshot.reason_flags = reasons;
     flight_failsafe_snapshot.imu_valid = imu_is_valid();
+    flight_failsafe_snapshot.imu_attitude_valid = imu_attitude_is_valid();
     flight_failsafe_snapshot.tof_ok = tof_health_ok();
     flight_failsafe_snapshot.flow_valid = vehicle_state.flow_valid;
     flight_failsafe_snapshot.flow_quality = lc302_data.quality;
     flight_failsafe_snapshot.time_us = system_time_us();
+    flight_failsafe_snapshot.imu_bad_frame_count = imu_get_bad_frame_count();
     flight_failsafe_snapshot.lc302_bytes = lc302_data.byte_count;
     flight_failsafe_snapshot.lc302_frames = lc302_data.frame_count;
     flight_failsafe_snapshot.voltage = vehicle_state.battery_voltage_filtered;
@@ -235,7 +239,10 @@ static void sensor_safety_update(float dT_s)
         return;
     }
 
-    flight_imu_fault_time_s = (imu_is_valid() == 0u) ?
+    /* In flight, acceleration quality may be temporarily poor while gyro
+     * propagation and attitude remain usable.  Auto-land only on a stale or
+     * invalid attitude solution; keep imu_is_valid() for strict preflight. */
+    flight_imu_fault_time_s = (imu_attitude_is_valid() == 0u) ?
         (flight_imu_fault_time_s + dT_s) : 0.0f;
     flight_tof_fault_time_s = (tof_health_ok() == 0u) ?
         (flight_tof_fault_time_s + dT_s) : 0.0f;
@@ -366,6 +373,9 @@ typedef struct {
     float vel_y_e;
     float vel_tgt_x_e;
     float vel_tgt_y_e;
+    float recovery_closing_speed;
+    float recovery_stop_speed;
+    uint8_t recovery_brake_active;
     float vel_err_x_b;
     float vel_err_y_b;
     float loc_raw_roll;
@@ -542,6 +552,9 @@ void debug_capture_states_20ms(void)
         sample->vel_y_e = loc_1l_ct.fb_vel_y;
         sample->vel_tgt_x_e = loc_1l_ct.exp_vel_x;
         sample->vel_tgt_y_e = loc_1l_ct.exp_vel_y;
+        sample->recovery_closing_speed = loc_1l_ct.recovery_closing_speed;
+        sample->recovery_stop_speed = loc_1l_ct.recovery_stop_speed;
+        sample->recovery_brake_active = loc_1l_ct.recovery_brake_active;
         
         sample->vel_err_x_b = loc_1l_ct.vel_err_x_body;
         sample->vel_err_y_b = loc_1l_ct.vel_err_y_body;
@@ -706,12 +719,14 @@ static void debug_print_safety_snapshots(void)
 
     if(flight_failsafe_snapshot.pending != 0u)
     {
-        printf("[SENSOR_FAILSAFE],action=AUTO_LAND,flags=0x%02X,time_us=%lu,voltage=%.2f,height_cm=%.2f,imu=%u,tof_ok=%u,flow=%u,flow_quality=%u,lc302_bytes=%lu,lc302_frames=%lu,reason_imu=%u,reason_tof=%u,reason_flow=%u\r\n",
+        printf("[SENSOR_FAILSAFE],action=AUTO_LAND,flags=0x%02X,time_us=%lu,voltage=%.2f,height_cm=%.2f,imu_strict=%u,imu_attitude=%u,imu_bad_frames=%lu,tof_ok=%u,flow=%u,flow_quality=%u,lc302_bytes=%lu,lc302_frames=%lu,reason_imu=%u,reason_tof=%u,reason_flow=%u\r\n",
                flight_failsafe_snapshot.reason_flags,
                (unsigned long)flight_failsafe_snapshot.time_us,
                flight_failsafe_snapshot.voltage,
                flight_failsafe_snapshot.height_cm,
                flight_failsafe_snapshot.imu_valid,
+               flight_failsafe_snapshot.imu_attitude_valid,
+               (unsigned long)flight_failsafe_snapshot.imu_bad_frame_count,
                flight_failsafe_snapshot.tof_ok,
                flight_failsafe_snapshot.flow_valid,
                flight_failsafe_snapshot.flow_quality,
@@ -750,7 +765,7 @@ void debug_print_states(void)
                alt_ctrl.vel_pid.kp, alt_ctrl.vel_pid.ki, alt_ctrl.vel_pid.kd,
                loc_ctrl.angle_limit, loc_ctrl.vel_limit);
                
-        printf("seq,time_us,dt_ms,armed,phase,voltage,loc_ready,loc_hold,loc_weight,yaw_deg,pos_err_x_e,pos_err_y_e,vel_x_e,vel_y_e,vel_tgt_x_e,vel_tgt_y_e,vel_err_x_b,vel_err_y_b,loc_raw_roll,loc_raw_pitch,loc_ramped_roll,loc_ramped_pitch,loc_vel_p_x,loc_vel_i_x,loc_vel_d_x,loc_vel_p_y,loc_vel_i_y,loc_vel_d_y,roll_tgt,roll_cur,pitch_tgt,pitch_cur,sp_rate_ff_roll,sp_rate_ff_pitch,rate_tgt_r,rate_fb_r,rate_out_r,rate_p_r,rate_i_r,rate_d_r,rate_tgt_p,rate_fb_p,rate_out_p,imu_acc_body_y_m_s2,flow_obs_vx_e,flow_obs_vy_e,ekf_vx_e,ekf_vy_e,flow_valid,flow_obs_valid,flow_ekf_used,flow_gate_clipped,throttle,height_cm,vel_z_cm_s,m1,m2,m3,m4,att_voltage_scale,goal_pos_x_e,goal_pos_y_e,profile_pos_x_e,profile_pos_y_e,profile_vel_x_e,profile_vel_y_e\r\n");
+        printf("seq,time_us,dt_ms,armed,phase,voltage,loc_ready,loc_hold,loc_weight,yaw_deg,pos_err_x_e,pos_err_y_e,vel_x_e,vel_y_e,vel_tgt_x_e,vel_tgt_y_e,recovery_closing_speed,recovery_stop_speed,recovery_brake_active,vel_err_x_b,vel_err_y_b,loc_raw_roll,loc_raw_pitch,loc_ramped_roll,loc_ramped_pitch,loc_vel_p_x,loc_vel_i_x,loc_vel_d_x,loc_vel_p_y,loc_vel_i_y,loc_vel_d_y,roll_tgt,roll_cur,pitch_tgt,pitch_cur,sp_rate_ff_roll,sp_rate_ff_pitch,rate_tgt_r,rate_fb_r,rate_out_r,rate_p_r,rate_i_r,rate_d_r,rate_tgt_p,rate_fb_p,rate_out_p,imu_acc_body_y_m_s2,flow_obs_vx_e,flow_obs_vy_e,ekf_vx_e,ekf_vy_e,flow_valid,flow_obs_valid,flow_ekf_used,flow_gate_clipped,throttle,height_cm,vel_z_cm_s,m1,m2,m3,m4,att_voltage_scale,goal_pos_x_e,goal_pos_y_e,profile_pos_x_e,profile_pos_y_e,profile_vel_x_e,profile_vel_y_e\r\n");
     }
 
     uint8_t lines = 0u;
@@ -760,10 +775,11 @@ void debug_print_states(void)
         uint16_t real_idx = (start_idx + debug_state_dump_index) % DEBUG_STATE_LOG_SAMPLE_COUNT;
         const debug_state_sample_t *sample = &debug_state_buf[real_idx];
 
-        printf("%lu,%lu,%.2f,%u,%u,%.2f,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+        printf("%lu,%lu,%.2f,%u,%u,%.2f,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
                (unsigned long)sample->seq, (unsigned long)sample->time_us, sample->dt_ms, sample->armed, sample->phase, sample->voltage,
                sample->loc_ready, sample->loc_hold, sample->loc_weight, sample->yaw_deg,
                sample->pos_err_x_e, sample->pos_err_y_e, sample->vel_x_e, sample->vel_y_e, sample->vel_tgt_x_e, sample->vel_tgt_y_e,
+               sample->recovery_closing_speed, sample->recovery_stop_speed, sample->recovery_brake_active,
                sample->vel_err_x_b, sample->vel_err_y_b, sample->loc_raw_roll, sample->loc_raw_pitch, sample->loc_ramped_roll, sample->loc_ramped_pitch,
                sample->loc_vel_p_x, sample->loc_vel_i_x, sample->loc_vel_d_x, sample->loc_vel_p_y, sample->loc_vel_i_y, sample->loc_vel_d_y,
                sample->roll_tgt, sample->roll_cur, sample->pitch_tgt, sample->pitch_cur, sample->sp_rate_ff_roll, sample->sp_rate_ff_pitch,
@@ -822,7 +838,7 @@ void debug_print_states(void)
 
     if(debug_state_dump_index == 0u)
     {
-        printf("seq,time_us,dt_ms,armed,phase,voltage,loc_ready,loc_hold,loc_weight,yaw_deg,pos_err_x_e,pos_err_y_e,vel_x_e,vel_y_e,vel_tgt_x_e,vel_tgt_y_e,vel_err_x_b,vel_err_y_b,loc_raw_roll,loc_raw_pitch,loc_bias_roll,loc_bias_pitch,loc_ramped_roll,loc_ramped_pitch,loc_vel_p_x,loc_vel_i_x,loc_vel_d_x,loc_vel_p_y,loc_vel_i_y,loc_vel_d_y,roll_tgt,roll_cur,pitch_tgt,pitch_cur,sp_rate_ff_roll,sp_rate_ff_pitch,rate_tgt_r,rate_fb_r,rate_out_r,rate_p_r,rate_i_r,rate_d_r,rate_tgt_p,rate_fb_p,rate_out_p,imu_acc_body_y_m_s2,flow_obs_vx_e,flow_obs_vy_e,ekf_vx_e,ekf_vy_e,flow_valid,flow_obs_valid,flow_ekf_used,flow_gate_clipped,throttle,height_cm,vel_z_cm_s,m1,m2,m3,m4,att_voltage_scale,goal_pos_x_e,goal_pos_y_e,profile_pos_x_e,profile_pos_y_e,profile_vel_x_e,profile_vel_y_e\r\n");
+        printf("seq,time_us,dt_ms,armed,phase,voltage,loc_ready,loc_hold,loc_weight,yaw_deg,pos_err_x_e,pos_err_y_e,vel_x_e,vel_y_e,vel_tgt_x_e,vel_tgt_y_e,recovery_closing_speed,recovery_stop_speed,recovery_brake_active,vel_err_x_b,vel_err_y_b,loc_raw_roll,loc_raw_pitch,loc_bias_roll,loc_bias_pitch,loc_ramped_roll,loc_ramped_pitch,loc_vel_p_x,loc_vel_i_x,loc_vel_d_x,loc_vel_p_y,loc_vel_i_y,loc_vel_d_y,roll_tgt,roll_cur,pitch_tgt,pitch_cur,sp_rate_ff_roll,sp_rate_ff_pitch,rate_tgt_r,rate_fb_r,rate_out_r,rate_p_r,rate_i_r,rate_d_r,rate_tgt_p,rate_fb_p,rate_out_p,imu_acc_body_y_m_s2,flow_obs_vx_e,flow_obs_vy_e,ekf_vx_e,ekf_vy_e,flow_valid,flow_obs_valid,flow_ekf_used,flow_gate_clipped,throttle,height_cm,vel_z_cm_s,m1,m2,m3,m4,att_voltage_scale,goal_pos_x_e,goal_pos_y_e,profile_pos_x_e,profile_pos_y_e,profile_vel_x_e,profile_vel_y_e\r\n");
     }
 
     uint8_t lines = 0u;
@@ -832,10 +848,11 @@ void debug_print_states(void)
         uint16_t real_idx = (start_idx + debug_state_dump_index) % DEBUG_STATE_LOG_SAMPLE_COUNT;
         const debug_state_sample_t *sample = &debug_state_buf[real_idx];
 
-        printf("%lu,%lu,%.2f,%u,%u,%.2f,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+        printf("%lu,%lu,%.2f,%u,%u,%.2f,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
                (unsigned long)sample->seq, (unsigned long)sample->time_us, sample->dt_ms, sample->armed, sample->phase, sample->voltage,
                sample->loc_ready, sample->loc_hold, sample->loc_weight, sample->yaw_deg,
                sample->pos_err_x_e, sample->pos_err_y_e, sample->vel_x_e, sample->vel_y_e, sample->vel_tgt_x_e, sample->vel_tgt_y_e,
+               sample->recovery_closing_speed, sample->recovery_stop_speed, sample->recovery_brake_active,
                sample->vel_err_x_b, sample->vel_err_y_b, sample->loc_raw_roll, sample->loc_raw_pitch, sample->loc_bias_roll, sample->loc_bias_pitch, sample->loc_ramped_roll, sample->loc_ramped_pitch,
                sample->loc_vel_p_x, sample->loc_vel_i_x, sample->loc_vel_d_x, sample->loc_vel_p_y, sample->loc_vel_i_y, sample->loc_vel_d_y,
                sample->roll_tgt, sample->roll_cur, sample->pitch_tgt, sample->pitch_cur, sample->sp_rate_ff_roll, sample->sp_rate_ff_pitch,
@@ -909,13 +926,22 @@ void debug_print_states(void)
                alt_ctrl.vel_pid.kp, alt_ctrl.vel_pid.ki, alt_ctrl.vel_pid.kd,
                LOC_MAX_OUTPUT_ANGLE_DEG, MAX_HORIZONTAL_SPEED);
         printf("LOCBIASCFG,enabled=0,steady_bias_source=VEL_I,i_max_cm_s2=20.0\r\n");
-        printf("PROFILECFG,pos_correction_cm_s=%.1f,profile_near_cm_s=%.1f,profile_far_cm_s=%.1f,total_vel_cm_s=%.1f,leash_start_cm=%.1f,leash_max_cm=%.1f,opposing_ff=blocked\r\n",
+        printf("PROFILECFG,pos_correction_cm_s=%.1f,terminal_pos_correction_cm_s=%.1f,terminal_total_vel_cm_s=%.1f,terminal_radius_cm=%.1f,terminal_cruise_radius_cm=%.1f,profile_near_cm_s=%.1f,profile_far_cm_s=%.1f,total_vel_cm_s=%.1f,leash_start_cm=%.1f,leash_max_cm=%.1f,leash_min_speed_scale=%.2f,opposing_ff=blocked,recovery_brake=enabled,terminal_hold=direct_pd,terminal_damping_scale=%.2f,brake_margin_cm_s=%.1f,brake_slew_cm_s2=%.1f,brake_accel_cm_s2=%.1f\r\n",
                LOC_POS_CORRECTION_LIMIT_CM_S,
+               LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S,
+               LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S,
+               LOC_TERMINAL_APPROACH_RADIUS_CM,
+               LOC_TERMINAL_CRUISE_RADIUS_CM,
                LOC_PROFILE_NEAR_SPEED_CM_S,
                LOC_PROFILE_FAR_SPEED_CM_S,
                LOC_TOTAL_VEL_LIMIT_CM_S,
                LOC_PROFILE_LEASH_START_CM,
-               LOC_PROFILE_LEASH_MAX_CM);
+               LOC_PROFILE_LEASH_MAX_CM,
+               LOC_PROFILE_LEASH_MIN_SPEED_SCALE,
+               LOC_TERMINAL_VEL_DAMPING_SCALE,
+               LOC_RECOVERY_BRAKE_MARGIN_CM_S,
+               LOC_RECOVERY_BRAKE_VEL_SLEW_CM_S2,
+               LOC_TRAJ_ACCEL_CM_S2);
         debug_print_safety_snapshots();
         printf("DEBUG_STATE_END\r\n");
         debug_state_ready = 0u;
@@ -967,23 +993,32 @@ void param_update(float dT_s)
 
     if(auto_landing_request != 0u)
     {
+        uint8_t auto_land_entering = (auto_landing_active == 0u) ? 1u : 0u;
+
         auto_landing_active = 1u;
         vehicle_state.flight_mode = FLY_AUTOLANDING;
         vehicle_setpoint.target_height = AUTO_LAND_TARGET_HEIGHT_CM;
-        vehicle_setpoint.target_pos_x  = vehicle_state.current_pos_x;
-        vehicle_setpoint.target_pos_y  = vehicle_state.current_pos_y;
-        vehicle_setpoint.target_vel_x  = 0.0f;
-        vehicle_setpoint.target_vel_y  = 0.0f;
-        vehicle_setpoint.target_roll = 0.0f;
-        vehicle_setpoint.target_pitch = 0.0f;
+
+        /* Capture the horizontal landing point once.  Rewriting it to the
+         * current EKF position every cycle silently cancels optical-flow hold
+         * during descent, precisely when a ToF-only fault still leaves the
+         * horizontal estimator healthy. */
+        if(auto_land_entering != 0u)
+        {
+            vehicle_setpoint.target_pos_x  = vehicle_state.current_pos_x;
+            vehicle_setpoint.target_pos_y  = vehicle_state.current_pos_y;
+            vehicle_setpoint.target_vel_x  = 0.0f;
+            vehicle_setpoint.target_vel_y  = 0.0f;
+            vehicle_setpoint.target_roll = 0.0f;
+            vehicle_setpoint.target_pitch = 0.0f;
+        }
         vehicle_setpoint.target_yaw_rate = 0.0f;
 
         /* Normal path uses ToF height/velocity.  If ToF itself caused the
          * failsafe, the altitude state may be stale; in that case the
          * throttle-based landed detector in alt_ctrl provides the fallback. */
         if((alt_phase == ALT_PHASE_LANDED) ||
-           ((vehicle_state.current_height <= AUTO_LAND_DISARM_HEIGHT_CM) &&
-            (fabsf(vehicle_state.current_vel_z) <= AUTO_LAND_DISARM_VEL_CM_S)))
+           (vehicle_state.current_height <= AUTO_LAND_DISARM_HEIGHT_CM))
         {
             vehicle_state.armed = 0u;
             auto_landing_request = 0u;

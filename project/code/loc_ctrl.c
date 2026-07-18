@@ -290,6 +290,9 @@ static void loc_update_position_profile(float goal_x,
     tracking_scale = 1.0f - ctrl_smoothstep01(
         (tracking_distance - LOC_PROFILE_LEASH_START_CM) /
         (LOC_PROFILE_LEASH_MAX_CM - LOC_PROFILE_LEASH_START_CM));
+    tracking_scale = LOC_PROFILE_LEASH_MIN_SPEED_SCALE +
+                     (1.0f - LOC_PROFILE_LEASH_MIN_SPEED_SCALE) *
+                     tracking_scale;
     desired_speed *= tracking_scale;
     desired_vx = desired_speed * dx / distance;
     desired_vy = desired_speed * dy / distance;
@@ -338,6 +341,9 @@ static void loc_reset_vel_debug(void)
     loc_1l_ct.horizontal_bias_roll = 0.0f;
     loc_1l_ct.horizontal_bias_pitch = 0.0f;
     loc_1l_ct.loc_weight = loc_rt.loc_weight;
+    loc_1l_ct.recovery_closing_speed = 0.0f;
+    loc_1l_ct.recovery_stop_speed = 0.0f;
+    loc_1l_ct.recovery_brake_active = 0u;
     loc_1l_ct.loc_ready = 0u;
     loc_1l_ct.loc_hold_ready = 0u;
 }
@@ -441,10 +447,6 @@ static float loc_damping_angle_limit(void)
            (height_angle_limit - LOC_DAMPING_MIN_OUTPUT_ANGLE_DEG) * reduce_ratio;
 }
 
-
-// ============================================================================
-// Coordinate transform helpers
-// ============================================================================
 static void loc_earth_vel_err_to_body(float err_x_earth,
                                       float err_y_earth,
                                       float *err_x_body,
@@ -459,13 +461,7 @@ static float loc_accel_to_angle_deg(float accel_cm_s2)
     return atan2f(accel_cm_s2, LOC_GRAVITY_CM_S2) * 57.2957795f;
 }
 
-/*
- * The velocity PID integrators are body-axis components because their inputs
- * are body-axis velocity errors.  Preserve the represented earth-frame
- * correction when yaw changes by rotating the stored vector into the new body
- * frame.  Without this, an old body-X/Y integral silently changes its physical
- * direction as the aircraft yaws.
- */
+
 static void loc_rotate_vel_integrators_with_yaw(void)
 {
     const float yaw_sin = vehicle_state.yaw_sin;
@@ -494,11 +490,6 @@ static void loc_rotate_vel_integrators_with_yaw(void)
     loc_rt.vel_i_yaw_cos = yaw_cos;
 }
 
-/* Learn only in a calm, valid hold.  Capture/braking velocity errors are
- * transients, not stationary CG/tether bias, so they must never enter trim. */
-// ============================================================================
-// Public interface
-// ============================================================================
 
 // 位置控制初始化
 void loc_ctrl_init(void)
@@ -552,6 +543,9 @@ void loc_ctrl_init(void)
 // 位置环控制（外环）
 void loc_2level_ctrl(float dT_s)
 {
+    loc_1l_ct.recovery_closing_speed = 0.0f;
+    loc_1l_ct.recovery_stop_speed = 0.0f;
+    loc_1l_ct.recovery_brake_active = 0u;
 
     if(loc_control_enabled() == 0u)
     {
@@ -609,6 +603,20 @@ void loc_2level_ctrl(float dT_s)
 
         float goal_err_x = vehicle_setpoint.target_pos_x - loc_2l_ct.fb_pos_x;
         float goal_err_y = vehicle_setpoint.target_pos_y - loc_2l_ct.fb_pos_y;
+        float goal_distance = sqrtf(goal_err_x * goal_err_x +
+                                    goal_err_y * goal_err_y);
+        float terminal_blend = ctrl_smoothstep01(
+            (goal_distance - LOC_TERMINAL_APPROACH_RADIUS_CM) /
+            (LOC_TERMINAL_CRUISE_RADIUS_CM -
+             LOC_TERMINAL_APPROACH_RADIUS_CM));
+        float pos_correction_limit =
+            LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S +
+            (LOC_POS_CORRECTION_LIMIT_CM_S -
+             LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S) * terminal_blend;
+        float total_vel_limit =
+            LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S +
+            (LOC_TOTAL_VEL_LIMIT_CM_S - LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S) *
+            terminal_blend;
 
         loc_update_position_profile(vehicle_setpoint.target_pos_x,
                                     vehicle_setpoint.target_pos_y,
@@ -624,15 +632,21 @@ void loc_2level_ctrl(float dT_s)
          * goal after its internal reference overshoots.  It must never cancel
          * the position feedback that is trying to return to the competition
          * target.  Keep aligned feed-forward, reject only the opposing part. */
+        /* Profile velocity is a normal feed-forward term, not a second goal.
+         * Keep only the component that points to the final competition target;
+         * the final position feedback, terminal speed envelope and velocity
+         * PID remain authoritative for capture and braking. */
         float profile_ff_x = ctrl_terminal_clamp(goal_err_x,
                                                   loc_rt.profile_vel_x);
         float profile_ff_y = ctrl_terminal_clamp(goal_err_y,
                                                   loc_rt.profile_vel_y);
 
-        loc_2l_ct.exp_vel_x = profile_ff_x +
-            stan_pid_solve(&loc_ctrl.pos_pid[0], goal_err_x, dT_s, 0);
-        loc_2l_ct.exp_vel_y = profile_ff_y +
-            stan_pid_solve(&loc_ctrl.pos_pid[1], goal_err_y, dT_s, 0);
+        loc_2l_ct.exp_vel_x = profile_ff_x + LIMIT(
+            stan_pid_solve(&loc_ctrl.pos_pid[0], goal_err_x, dT_s, 0),
+            -pos_correction_limit, pos_correction_limit);
+        loc_2l_ct.exp_vel_y = profile_ff_y + LIMIT(
+            stan_pid_solve(&loc_ctrl.pos_pid[1], goal_err_y, dT_s, 0),
+            -pos_correction_limit, pos_correction_limit);
 
         loc_2l_ct.exp_vel_x=ctrl_terminal_clamp(goal_err_x,loc_2l_ct.exp_vel_x);
         loc_2l_ct.exp_vel_y=ctrl_terminal_clamp(goal_err_y,loc_2l_ct.exp_vel_y);
@@ -652,25 +666,60 @@ void loc_2level_ctrl(float dT_s)
         float target_vel_y = loc_2l_ct.exp_vel_y;
         float target_speed = sqrtf(target_vel_x * target_vel_x +
                                    target_vel_y * target_vel_y);
+        uint8_t recovery_brake_active = 0u;
+        float recovery_closing_speed = 0.0f;
+        float recovery_stop_speed = 0.0f;
 
         /* The competition limit is a horizontal vector speed, not a per-axis
          * limit; preserve direction when the profile and correction sum is
          * larger than the available cruise speed. */
-        if(target_speed > LOC_TOTAL_VEL_LIMIT_CM_S)
+        if(target_speed > total_vel_limit)
         {
-            target_vel_x *= LOC_TOTAL_VEL_LIMIT_CM_S / target_speed;
-            target_vel_y *= LOC_TOTAL_VEL_LIMIT_CM_S / target_speed;
+            target_vel_x *= total_vel_limit / target_speed;
+            target_vel_y *= total_vel_limit / target_speed;
         }
+
+        /* Braking must be based on measured closing speed as well as
+         * remaining distance.  A position-only target keeps asking for a
+         * small toward-goal velocity even when the aircraft is already
+         * crossing the target far too fast to stop in time. */
+        if(goal_distance > 0.5f)
+        {
+            float goal_unit_x = goal_err_x / goal_distance;
+            float goal_unit_y = goal_err_y / goal_distance;
+            float closing_speed =
+                vehicle_state.current_vel_x * goal_unit_x +
+                vehicle_state.current_vel_y * goal_unit_y;
+            float stop_speed = sqrtf(2.0f * LOC_TRAJ_ACCEL_CM_S2 *
+                                      goal_distance);
+            recovery_closing_speed = closing_speed;
+            recovery_stop_speed = stop_speed;
+
+            if(closing_speed > (stop_speed + LOC_RECOVERY_BRAKE_MARGIN_CM_S))
+            {
+                target_vel_x = -goal_unit_x * total_vel_limit;
+                target_vel_y = -goal_unit_y * total_vel_limit;
+                recovery_brake_active = 1u;
+            }
+        }
+
+            loc_1l_ct.recovery_closing_speed = recovery_closing_speed;
+            loc_1l_ct.recovery_stop_speed = recovery_stop_speed;
+            loc_1l_ct.recovery_brake_active = recovery_brake_active;
 
             loc_rt.target_vel_x_ramped =
                 ctrl_slew_limit(loc_rt.target_vel_x_ramped,
                                 target_vel_x,
+                                (recovery_brake_active != 0u) ?
+                                LOC_RECOVERY_BRAKE_VEL_SLEW_CM_S2 :
                                 LOC_TARGET_VEL_SLEW_CM_S2,
                                 dT_s);
 
             loc_rt.target_vel_y_ramped =
                 ctrl_slew_limit(loc_rt.target_vel_y_ramped,
                                 target_vel_y,
+                                (recovery_brake_active != 0u) ?
+                                LOC_RECOVERY_BRAKE_VEL_SLEW_CM_S2 :
                                 LOC_TARGET_VEL_SLEW_CM_S2,
                                 dT_s);
 
@@ -721,11 +770,57 @@ void loc_1level_ctrl(float dT_s)
 
         float vel_err_x_earth = loc_1l_ct.exp_vel_x - loc_1l_ct.fb_vel_x;
         float vel_err_y_earth = loc_1l_ct.exp_vel_y - loc_1l_ct.fb_vel_y;
+        float terminal_direct_weight = 0.0f;
+        float current_vel_x_body = 0.0f;
+        float current_vel_y_body = 0.0f;
 
         float vel_err_x_body;
         float vel_err_y_body;
 
+        if(loc_hold_ready() != 0u)
+        {
+            float goal_err_x = vehicle_setpoint.target_pos_x -
+                               vehicle_state.current_pos_x;
+            float goal_err_y = vehicle_setpoint.target_pos_y -
+                               vehicle_state.current_pos_y;
+            float goal_distance = sqrtf(goal_err_x * goal_err_x +
+                                        goal_err_y * goal_err_y);
+            float direct_vel_x = LIMIT(loc_ctrl.pos_pid[0].kp * goal_err_x,
+                                       -LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S,
+                                        LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S);
+            float direct_vel_y = LIMIT(loc_ctrl.pos_pid[1].kp * goal_err_y,
+                                       -LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S,
+                                        LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S);
+            float direct_speed = sqrtf(direct_vel_x * direct_vel_x +
+                                       direct_vel_y * direct_vel_y);
+
+            if(direct_speed > LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S)
+            {
+                direct_vel_x *= LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S /
+                                direct_speed;
+                direct_vel_y *= LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S /
+                                direct_speed;
+            }
+
+            terminal_direct_weight = 1.0f - ctrl_smoothstep01(
+                (goal_distance - LOC_TERMINAL_APPROACH_RADIUS_CM) /
+                (LOC_TERMINAL_CRUISE_RADIUS_CM -
+                 LOC_TERMINAL_APPROACH_RADIUS_CM));
+
+            /* In terminal hold, close directly on the final position and
+             * measured velocity.  Profile, target-velocity slew and recovery
+             * logic remain authoritative outside the terminal blend. */
+            vel_err_x_earth += terminal_direct_weight *
+                ((direct_vel_x - loc_1l_ct.fb_vel_x) - vel_err_x_earth);
+            vel_err_y_earth += terminal_direct_weight *
+                ((direct_vel_y - loc_1l_ct.fb_vel_y) - vel_err_y_earth);
+        }
+
         loc_rotate_vel_integrators_with_yaw();
+        loc_earth_vel_err_to_body(loc_1l_ct.fb_vel_x,
+                                  loc_1l_ct.fb_vel_y,
+                                  &current_vel_x_body,
+                                  &current_vel_y_body);
         loc_earth_vel_err_to_body(vel_err_x_earth,
                                   vel_err_y_earth,
                                   &vel_err_x_body,
@@ -768,26 +863,69 @@ void loc_1level_ctrl(float dT_s)
                 (vel_err_y_body - loc_rt.vel_err_y_body_filtered) *
                 lpf_alpha;
 
-            vel_err_x_body = loc_soft_deadband(loc_rt.vel_err_x_body_filtered,
-                                               deadband);
-            vel_err_y_body = loc_soft_deadband(loc_rt.vel_err_y_body_filtered,
-                                               deadband);
+            /* The direct terminal controller uses the current measured
+             * velocity as damping.  Blending the old filtered path out avoids
+             * carrying its phase lag into the final hold region. */
+            vel_err_x_body = terminal_direct_weight * vel_err_x_body +
+                (1.0f - terminal_direct_weight) *
+                loc_soft_deadband(loc_rt.vel_err_x_body_filtered, deadband);
+            vel_err_y_body = terminal_direct_weight * vel_err_y_body +
+                (1.0f - terminal_direct_weight) *
+                loc_soft_deadband(loc_rt.vel_err_y_body_filtered, deadband);
         }
 
         loc_1l_ct.vel_err_x_body = vel_err_x_body;
         loc_1l_ct.vel_err_y_body = vel_err_y_body;
 
+        /* The velocity I term is a steady-bias compensator, not a braking
+         * command.  During a return or overshoot its old direction can oppose
+         * the now-reversed velocity error and delay recovery through the
+         * target.  Release only that conflicting memory while a valid hold is
+         * active; keep the remaining I term for CG/voltage bias compensation.
+         * At 50 Hz, 0.96 gives an approximately 0.5 s release time constant. */
+        if(loc_hold_ready() != 0u)
+        {
+            if((loc_ctrl.vel_pid[0].out_i * vel_err_x_body) < 0.0f)
+            {
+                loc_ctrl.vel_pid[0].out_i *= LOC_VEL_I_OPPOSE_DECAY;
+            }
+            if((loc_ctrl.vel_pid[1].out_i * vel_err_y_body) < 0.0f)
+            {
+                loc_ctrl.vel_pid[1].out_i *= LOC_VEL_I_OPPOSE_DECAY;
+            }
+        }
+
      
-        loc_1l_ct.target_accel_x_body =
-            stan_pid_solve(&loc_ctrl.vel_pid[0],
-                           vel_err_x_body,
-                           dT_s,
-                           loc_rt.vel_pid_saturated_x);
-        loc_1l_ct.target_accel_y_body =
-            stan_pid_solve(&loc_ctrl.vel_pid[1],
-                           vel_err_y_body,
-                           dT_s,
-                           loc_rt.vel_pid_saturated_y);
+        {
+            float pid_accel_x = stan_pid_solve(&loc_ctrl.vel_pid[0],
+                                               vel_err_x_body,
+                                               dT_s,
+                                               loc_rt.vel_pid_saturated_x);
+            float pid_accel_y = stan_pid_solve(&loc_ctrl.vel_pid[1],
+                                               vel_err_y_body,
+                                               dT_s,
+                                               loc_rt.vel_pid_saturated_y);
+            float direct_accel_x = loc_ctrl.vel_pid[0].kp * vel_err_x_body +
+                                   loc_ctrl.vel_pid[0].out_i -
+                (LOC_TERMINAL_VEL_DAMPING_SCALE - 1.0f) *
+                loc_ctrl.vel_pid[0].kp * current_vel_x_body;
+            float direct_accel_y = loc_ctrl.vel_pid[1].kp * vel_err_y_body +
+                                   loc_ctrl.vel_pid[1].out_i -
+                (LOC_TERMINAL_VEL_DAMPING_SCALE - 1.0f) *
+                loc_ctrl.vel_pid[1].kp * current_vel_y_body;
+
+            /* At the final hold point this is the explicit second-order law:
+             * accel = (pos_kp * vel_kp) * position_error
+             *       - damping_scale * vel_kp * measured_velocity
+             *       + bounded bias integral.
+             * The P/I gains remain Flash-sourced.  The explicit terminal
+             * damping scale is logged in PROFILECFG; D is blended out because
+             * measured velocity already supplies physical damping. */
+            loc_1l_ct.target_accel_x_body = pid_accel_x +
+                terminal_direct_weight * (direct_accel_x - pid_accel_x);
+            loc_1l_ct.target_accel_y_body = pid_accel_y +
+                terminal_direct_weight * (direct_accel_y - pid_accel_y);
+        }
 
         /* +body-X acceleration requires negative pitch; +body-Y requires
          * positive roll for this airframe's established attitude signs. */

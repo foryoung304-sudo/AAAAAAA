@@ -73,6 +73,10 @@
 #define FLOW_LITE_MAX_DT_S 0.10f
 #define FLOW_LITE_R_VEL 600.0f
 #define FLOW_LITE_Q_VEL 200.0f
+/* The EKF must not consume a single LC302 frame directly.  A frame-scale
+ * displacement outlier otherwise becomes an immediate velocity command to
+ * the horizontal controller. */
+#define FLOW_EKF_VEL_LPF_ALPHA 0.30f
 #define FLOW_LC302_NOMINAL_FRAME_DT_S (1.0f / 48.0f)
 #define FLOW_LC302_MIN_FRAME_DT_S 0.005f
 #define FLOW_LC302_MAX_FRAME_DT_S 0.050f

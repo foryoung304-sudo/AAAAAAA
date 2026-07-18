@@ -708,9 +708,16 @@ void update_position_from_flow(float dT_s)
                                  (flow_health.tilt_valid != 0u) &&
                                  (flow_health.yaw_valid != 0u)) ? 1u : 0u;
         
-        // 低通滤波（滤除高频噪声）
-        flow_vel_x = 0.7f * flow_vel_x + 0.3f * new_vel_x;
-        flow_vel_y = 0.7f * flow_vel_y + 0.3f * new_vel_y;
+        /* Keep an observation-domain low-pass for the EKF.  Do not advance
+         * it with an invalid frame: otherwise an invalid observation can
+         * poison the next valid innovation. */
+        if(flow_health.obs_valid != 0u)
+        {
+            flow_vel_x = (1.0f - FLOW_EKF_VEL_LPF_ALPHA) * flow_vel_x +
+                         FLOW_EKF_VEL_LPF_ALPHA * new_vel_x;
+            flow_vel_y = (1.0f - FLOW_EKF_VEL_LPF_ALPHA) * flow_vel_y +
+                         FLOW_EKF_VEL_LPF_ALPHA * new_vel_y;
+        }
     }
     
     flow_speed = sqrtf(flow_vel_x * flow_vel_x + 
@@ -922,8 +929,11 @@ void ekf_lite_predict_xy(float dT_s)
 void ekf_lite_update_xy(float dT_s)
 {
     const float r_flow = FLOW_LITE_R_VEL; // 光流测量的噪声协方差 R
-    float innov_x = flow_health.obs_vx_cm_s - ekf_lite_state.vx; // X轴新息
-    float innov_y = flow_health.obs_vy_cm_s - ekf_lite_state.vy; // Y轴新息
+    /* Use the filtered observation, not the raw one-frame velocity.  The
+     * raw fields remain logged so an optical-flow outlier is still visible
+     * during diagnosis. */
+    float innov_x = flow_health.flow_vel_x_cm_s - ekf_lite_state.vx;
+    float innov_y = flow_health.flow_vel_y_cm_s - ekf_lite_state.vy;
     float kx;
     float ky;
     float obs_dt_s = flow_health.obs_dt_s;

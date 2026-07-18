@@ -67,6 +67,10 @@
 #define AUTO_LAND_DESCEND_SPEED_CM_S     10.0f
 #define AUTO_LAND_MIN_DESCEND_CMD_CM_S   3.0f
 #define AUTO_LAND_MIN_DESCEND_HEIGHT_CM  6.5f
+/* A ToF-loss landing has no trusted altitude/vertical-speed feedback.  Do
+ * not use the normal rapid descent in that case: command a conservative sink
+ * while keeping motors armed until a real ground confirmation is available. */
+#define AUTO_LAND_TOF_FAILSAFE_DESCEND_SPEED_CM_S  2.5f
 #define ALT_BRAKE_ACCEL_CM_S2            15.0f
 
 typedef enum

@@ -1132,7 +1132,25 @@
             <name>$PROJ_DIR$\..\..\code\beacon.c</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\mcar_comm.c</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\beacon.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\mcar_comm.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\mcar_guidance.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\mcar_guidance.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\vision_nav.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\vision_nav.h</name>
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\ctrl_common.c</name>

@@ -87,6 +87,7 @@ int main(void)
    loc_ctrl_init();
    pid_menu_init();
    small_driver_uart_init();
+   mcar_comm_init();
     wireless_uart_init();
 
     pit_ms_init(PIT_CH0, 2); 
