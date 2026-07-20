@@ -45,6 +45,10 @@
 #define LOC_HOLD_ERR_ACTIVE_CM 18.0f
 #define LOC_ENABLE_HEIGHT_CM       50.0f
 #define LOC_HOLD_ENABLE_HEIGHT_CM  65.0f
+#define LOC_AUTO_LOW_ENABLE_HEIGHT_CM      20.0f
+#define LOC_AUTO_LOW_HOLD_HEIGHT_CM        35.0f
+#define LOC_AUTO_LOW_MAX_OUTPUT_ANGLE_DEG   3.0f
+#define LOC_AUTO_LOW_ENABLE_VZ_MAX_CM_S    35.0f
 #define LOC_ENABLE_VZ_MAX_CM_S    12.0f
 #define LOC_ENABLE_HORIZ_VEL_MAX_CM_S  8.0f  /* hold 进入时最大横向合速度 */
 #define LOC_ENABLE_ATT_MAX_DEG     8.0f

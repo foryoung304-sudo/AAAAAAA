@@ -1,4 +1,5 @@
 #include "zf_common_headfile.h"
+#include "attitude_history.h"
 
 
 
@@ -859,11 +860,22 @@ void imu_calc(void)
     vehicle_state.yaw_sin   = sinf(imu_data.yaw   * 3.1415926f / 180.0f);
     vehicle_state.yaw_cos   = cosf(imu_data.yaw   * 3.1415926f / 180.0f);
 
+    attitude_history_record(current_time_us,
+                            imu_data.roll,
+                            imu_data.pitch,
+                            imu_data.yaw);
+    vision_attitude_shared_publish(current_time_us,
+                                   imu_data.roll,
+                                   imu_data.pitch,
+                                   imu_data.yaw,
+                                   vehicle_state.current_height);
+
 }
 
 // 初始化函数
 void imu_data_init(void)
 {
+    attitude_history_reset();
     // 初始化滤波器
     init_filters();
     

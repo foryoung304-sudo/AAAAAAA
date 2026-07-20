@@ -240,6 +240,8 @@ E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Libr
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\flow.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\system.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\small_driver_uart_control.h \
+  E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\mcar_comm.h \
+  E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\mcar_guidance.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\ctrl_common.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\att_ctrl.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\alt_ctrl.h \
@@ -247,6 +249,7 @@ E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Libr
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\remote_ctrl.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\fly_ctrl.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\beacon.h \
+  E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\vision_shared.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\pid_menu.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\code\debug.h \
   E:\CYT4BB7_Library-master\CYT4BB7_Library-master\Seekfree_CYT4BB_Opensource_Library\project\iar\project_config\..\..\..\libraries\zf_components\seekfree_assistant.h \

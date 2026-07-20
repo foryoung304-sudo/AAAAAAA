@@ -117,7 +117,7 @@ void pit0_ch0_isr()                     // ��ʱ��ͨ�� 0 ����
         lora3a22_state_flag = 0;           // ǿ�����㣺���� remote_ctrl.c �е�ʧ������Ͱ�ȫ�����߼�
     }
 
-    motor_mixing_output();
+    //motor_mixing_output();
     //small_driver_set_duty(duty,duty,duty,duty);
     
     // =================  20ms ���� =================

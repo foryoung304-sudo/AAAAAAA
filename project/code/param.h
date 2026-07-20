@@ -11,8 +11,15 @@
 #define MIN_HEIGHT               6.0f   //ToF补偿后的实测地面高度(cm)
 
 #define CAMERA_FOCAL_LENGTH_PIXEL     60.0f   //相机焦距(像素) 广角镜头通常在50~80之间
-#define IMAGE_CENTER_X          94.0f   //相机中心X坐标(像素)
-#define IMAGE_CENTER_Y          60.0f   //相机中心Y坐标(像素)
+#define IMAGE_CENTER_X 108.00f
+#define IMAGE_CENTER_Y 60.00f
+
+#define BEACON_SCALE_X 0.0198f  // 前后方向
+#define BEACON_SCALE_Y 0.0127f  // 左右方向
+
+// 相机位于机体中心后方10cm，机体系X前正、Y右正
+#define CAMERA_OFFSET_BODY_X_CM (-10.0f)
+#define CAMERA_OFFSET_BODY_Y_CM 0.0f
 
 #define MAX_ROLL_PITCH          10.0f   //最大横滚俯仰角(度)
 

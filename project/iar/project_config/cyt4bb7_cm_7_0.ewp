@@ -1129,6 +1129,12 @@
             <name>$PROJ_DIR$\..\..\code\att_ctrl.h</name>
         </file>
         <file>
+            <name>$PROJ_DIR$\..\..\code\attitude_history.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\attitude_history.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\beacon.c</name>
         </file>
         <file>
@@ -1136,6 +1142,12 @@
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\beacon.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\vision_shared.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\vision_shared.h</name>
         </file>
         <file>
             <name>$PROJ_DIR$\..\..\code\mcar_comm.h</name>

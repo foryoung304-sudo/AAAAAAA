@@ -1,3 +1,6 @@
+#ifndef EKF_LITE_H_
+#define EKF_LITE_H_
+
 #include "zf_common_headfile.h"
 
 #define EKF_LITE_TOF_GATE_CM 35.0f
@@ -32,3 +35,5 @@ extern ekf_lite_health_t ekf_lite_health;
 extern float ekf_lite_p_z[2][2];
 // XY轴(水平位置和速度)的协方差矩阵 P 的对角线元素 (x, y, vx, vy)
 extern float ekf_lite_p_xy[4] ;
+
+#endif

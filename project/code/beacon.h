@@ -1,6 +1,8 @@
 #ifndef __BEACON_H__
 #define __BEACON_H__
 
+#include "vision_shared.h"
+
 #include "zf_common_headfile.h"
 typedef enum {
     BEACON_NOT_FOUND = 0,
@@ -53,9 +55,11 @@ extern BeaconInfo beacon;
 #define CAR_W_RATIO_MIN 1.3f
 #define CAR_DIR_EMA_ALPHA 0.7f
 #define MAX_IR_BLOBS 32
+#define YCAR_DETECTION_ENABLE 1
+#define YCAR_GUIDANCE_ENABLE  0
 
 #define BEACON_CAL_DEBUG_ENABLE       1
-#define BEACON_CAL_DEBUG_INTERVAL_US  100000u
+#define BEACON_CAL_DEBUG_INTERVAL_US  500000u
 
 typedef enum {
     IR_BLOB_UNKNOWN = 0,
@@ -76,6 +80,7 @@ typedef struct {
     int16_t cy;
     float hx;
     float hy;
+    uint16_t score;
     uint8_t valid;
 } YCarInfo_t;
 
@@ -97,11 +102,18 @@ typedef struct {
 
 extern uint8_t debug_blob_cnt;
 extern float debug_beacon_score;
+extern float debug_beacon_second_score;
+extern int16_t debug_beacon_second_x;
+extern int16_t debug_beacon_second_y;
 extern uint8_t debug_beacon_lost;
 extern float beacon_corr_x;
 extern float beacon_corr_y;
 extern float beacon_body_x;
 extern float beacon_body_y;
+extern float beacon_camera_x_cm;
+extern float beacon_camera_y_cm;
+extern float beacon_drone_x_cm;
+extern float beacon_drone_y_cm;
 extern YCarInfo_t ycar_info;
 extern float ycar_body_x;
 extern float ycar_body_y;
@@ -109,16 +121,29 @@ extern float ycar_head_body_x;
 extern float ycar_head_body_y;
 extern float debug_ycar_angle;
 extern uint8_t debug_ycar_lost;
+extern VisionDetectionSnapshot_t vision_detection_snapshot;
+extern uint32_t vision_profile_camera_dt_us;
+extern uint32_t vision_profile_process_us;
+extern uint32_t vision_profile_remap_us;
+extern uint32_t vision_profile_blob_us;
+extern uint32_t vision_profile_detect_us;
+extern uint32_t vision_profile_display_us;
 
 uint16_t find_centers(const image_t *img, CenterPoint centers[MAX_CENTERS]);
 void detect_beacon(image_t *img, BeaconInfo *info);
 uint8_t beacon_find_blobs_gray(const image_t *img, BeaconBlob_t blobs[], uint8_t max_blobs);
 uint8_t ir_find_blobs_gray(const image_t *img, IrBlob_t blobs[], uint8_t max_blobs);
 void classify_ir_blobs(IrBlob_t blobs[], uint8_t blob_cnt);
-void detect_beacon_from_ir_blobs(const IrBlob_t blobs[], uint8_t blob_cnt, BeaconInfo *info);
+void detect_beacon_from_ir_blobs(const IrBlob_t blobs[], uint8_t blob_cnt,
+                                 float roll_deg, float pitch_deg,
+                                 BeaconInfo *info);
 void ycar_detect_from_ir_blobs(const image_t *img, const IrBlob_t blobs[], uint8_t blob_cnt, YCarInfo_t *info);
 void ycar_detect_gray(const image_t *img, YCarInfo_t *info);
 void vision_attitude_compensation(float u_raw, float v_raw, float *u_corr, float *v_corr);
+void vision_attitude_compensation_with_attitude(float u_raw, float v_raw,
+                                                 float roll_deg, float pitch_deg,
+                                                 float *u_corr, float *v_corr);
 uint8_t image_process();
+uint8_t vision_consumer_update(void);
 
 #endif

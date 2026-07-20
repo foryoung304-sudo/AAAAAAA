@@ -64,8 +64,6 @@ int main(void)
     // �˴���д�û����� ���������ʼ�������
  
 
-   ips114_init();
- //mt9v03x_init();
    lora3a22_init();
    //imu660rc_init(IMU660RC_QUARTERNION_DISABLE);
    icm42688_init();
@@ -79,16 +77,18 @@ int main(void)
 #endif
    imu_data_init();
    imu_calibrate();
+   (void)system_time_us();
 
    // ================= ����ɿظ�����ƻ��� PID ���� =================
    param_init();
    att_ctrl_init();
    alt_ctrl_init();
    loc_ctrl_init();
+   vision_nav_init();
    pid_menu_init();
    small_driver_uart_init();
    mcar_comm_init();
-    wireless_uart_init();
+    //wireless_uart_init();
 
     pit_ms_init(PIT_CH0, 2); 
     pit_enable(PIT_CH0);
@@ -115,7 +115,7 @@ int main(void)
             if(height_cost_us > main_height_max_us) main_height_max_us = height_cost_us;
         }
 
-        if(pid_menu_request)
+       /* if(pid_menu_request)
         {
             pid_menu_request = 0;
             pid_menu_task();
@@ -125,11 +125,10 @@ int main(void)
         {
             debug_print_request = 0;
             debug_print_states();
-        }
+        }*/
         
-
-       
-        //ips114_show_gray_image(0, 0, (uint8_t *)undistorted_img.data, MT9V03X_W, MT9V03X_H, MT9V03X_W, MT9V03X_H, 0);
+      vision_consumer_update();
+      //memcpy(base_image, mt9v03x_image, MT9V03X_IMAGE_SIZE); // 将采集到的图像数据复制到 base_image 中
 
 
 

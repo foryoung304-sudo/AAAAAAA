@@ -76,10 +76,22 @@ static uint8_t loc_output_base_ready(void)
             (loc_mode_enabled() != 0u));
 }
 
+static uint8_t loc_auto_low_height_mode(void)
+{
+    return ((vehicle_state.flight_mode == FLY_AUTOTAKEOFF) ||
+            (vehicle_state.flight_mode == FLY_AUTOLANDING)) ? 1u : 0u;
+}
+
+static float loc_damping_enable_height(void)
+{
+    return (loc_auto_low_height_mode() != 0u) ?
+           LOC_AUTO_LOW_ENABLE_HEIGHT_CM : LOC_ENABLE_HEIGHT_CM;
+}
+
 static uint8_t loc_damping_ready(void)
 {
     return ((loc_output_base_ready() != 0u) &&
-            (vehicle_state.current_height >= LOC_ENABLE_HEIGHT_CM));
+            (vehicle_state.current_height >= loc_damping_enable_height()));
 }
 
 static float loc_hold_enable_height(void)
@@ -87,7 +99,8 @@ static float loc_hold_enable_height(void)
     /* Horizontal authority must not move upward with a higher altitude goal.
      * Start damping at LOC_ENABLE_HEIGHT_CM, then allow position capture at a
      * fixed, proven height while the altitude profile continues climbing. */
-    return LOC_HOLD_ENABLE_HEIGHT_CM;
+    return (loc_auto_low_height_mode() != 0u) ?
+           LOC_AUTO_LOW_HOLD_HEIGHT_CM : LOC_HOLD_ENABLE_HEIGHT_CM;
 }
 
 static uint8_t loc_hold_entry_ready(void)
@@ -96,9 +109,12 @@ static uint8_t loc_hold_entry_ready(void)
     float horiz_spd = sqrtf(vehicle_state.current_vel_x * vehicle_state.current_vel_x +
                             vehicle_state.current_vel_y * vehicle_state.current_vel_y);
 
+    float vz_limit = (loc_auto_low_height_mode() != 0u) ?
+                     LOC_AUTO_LOW_ENABLE_VZ_MAX_CM_S : LOC_ENABLE_VZ_MAX_CM_S;
+
     return ((loc_damping_ready() != 0u) &&
             (vehicle_state.current_height >= enable_height) &&
-            (fabsf(vehicle_state.current_vel_z) <= LOC_ENABLE_VZ_MAX_CM_S) &&
+            (fabsf(vehicle_state.current_vel_z) <= vz_limit) &&
             (fabsf(vehicle_state.current_roll) <= LOC_ENABLE_ATT_MAX_DEG) &&
             (fabsf(vehicle_state.current_pitch) <= LOC_ENABLE_ATT_MAX_DEG) &&
             (horiz_spd <= LOC_ENABLE_HORIZ_VEL_MAX_CM_S));
@@ -109,9 +125,9 @@ static uint8_t loc_hold_should_release(void)
     float release_height =
         loc_hold_enable_height() - LOC_HOLD_RELEASE_MARGIN_CM;
 
-    if(release_height < LOC_ENABLE_HEIGHT_CM)
+    if(release_height < loc_damping_enable_height())
     {
-        release_height = LOC_ENABLE_HEIGHT_CM;
+        release_height = loc_damping_enable_height();
     }
 
     return ((loc_damping_ready() == 0u) ||
@@ -350,8 +366,11 @@ static void loc_reset_vel_debug(void)
 
 static void loc_hold_current_without_output(uint8_t clear_attitude_setpoint)
 {
-    vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
-    vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+    if(loc_auto_low_height_mode() == 0u)
+    {
+        vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
+        vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+    }
     vehicle_setpoint.target_vel_x = 0.0f;
     vehicle_setpoint.target_vel_y = 0.0f;
 
@@ -423,7 +442,8 @@ static float loc_hold_error_ratio(void)
 static float loc_damping_angle_limit(void)
 {
     float enable_height = loc_hold_enable_height();
-    float height_span = enable_height - LOC_ENABLE_HEIGHT_CM;
+    float damping_height = loc_damping_enable_height();
+    float height_span = enable_height - damping_height;
     float height_ratio = 1.0f;
     float vz_abs = fabsf(vehicle_state.current_vel_z);
     float reduce_ratio =
@@ -434,7 +454,7 @@ static float loc_damping_angle_limit(void)
     if(height_span > 0.001f)
     {
         height_ratio =
-            ctrl_smoothstep01((vehicle_state.current_height - LOC_ENABLE_HEIGHT_CM) /
+            ctrl_smoothstep01((vehicle_state.current_height - damping_height) /
                               height_span);
     }
 
@@ -573,8 +593,11 @@ void loc_2level_ctrl(float dT_s)
 
         if(loc_hold_ready() == 0u)
         {
-            vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
-            vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+            if(loc_auto_low_height_mode() == 0u)
+            {
+                vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
+                vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+            }
             vehicle_setpoint.target_vel_x = 0.0f;
             vehicle_setpoint.target_vel_y = 0.0f;
 
@@ -944,6 +967,12 @@ void loc_1level_ctrl(float dT_s)
         {
             angle_limit = loc_damping_angle_limit();
         }
+        if((loc_auto_low_height_mode() != 0u) &&
+           (vehicle_state.current_height < LOC_ENABLE_HEIGHT_CM))
+        {
+            angle_limit = fminf(angle_limit,
+                                LOC_AUTO_LOW_MAX_OUTPUT_ANGLE_DEG);
+        }
 
         /* Feed the real downstream authority limit back to the velocity PID.
          * stan_pid_solve() then freezes only integration that would push
@@ -1005,7 +1034,10 @@ void loc_ctrl_update(float dT_s)
     }
 
     // 检查状态
-    if(vehicle_state.flight_mode==FLY_POS_HOLD && loc_rt.last_flight_mode!=FLY_POS_HOLD)
+    if((vehicle_state.flight_mode != loc_rt.last_flight_mode) &&
+       ((vehicle_state.flight_mode == FLY_POS_HOLD) ||
+        (vehicle_state.flight_mode == FLY_AUTOTAKEOFF) ||
+        (vehicle_state.flight_mode == FLY_AUTOLANDING)))
     {
         vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
         vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
@@ -1027,8 +1059,11 @@ void loc_ctrl_update(float dT_s)
     {
         if(loc_rt.loc_ready_last == 0u)
         {
-            vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
-            vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+            if(loc_auto_low_height_mode() == 0u)
+            {
+                vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
+                vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+            }
             loc_reset_runtime_output();
             loc_reset_pids();
             loc_reset_vel_debug();
@@ -1060,9 +1095,12 @@ void loc_ctrl_update(float dT_s)
                 loc_rt.loc_hold_stable_time_s += dT_s;
                 if(loc_rt.loc_hold_stable_time_s >= 0.3f)
                 {
-                    /* Start the newly captured hold target */
-                    vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
-                    vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+                    /* Automatic takeoff/landing already owns a latched target. */
+                    if(loc_auto_low_height_mode() == 0u)
+                    {
+                        vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
+                        vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+                    }
                     loc_2l_ct.exp_pos_x = vehicle_state.current_pos_x;
                     loc_2l_ct.exp_pos_y = vehicle_state.current_pos_y;
                     loc_reset_position_profile(vehicle_state.current_pos_x,

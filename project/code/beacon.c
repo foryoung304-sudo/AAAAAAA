@@ -1,6 +1,7 @@
 #include "zf_common_headfile.h"
 #include "beacon.h"
 #include "vision_nav.h"
+#include "attitude_history.h"
 
 // 信标信息结构
 BeaconInfo beacon;
@@ -15,13 +16,27 @@ float last_erro = 94;   // 最后一次误差（初始值94）
 
 uint8_t debug_blob_cnt = 0;
 float debug_beacon_score = 0.0f;
+float debug_beacon_second_score = 0.0f;
+int16_t debug_beacon_second_x = 0;
+int16_t debug_beacon_second_y = 0;
 uint8_t debug_beacon_lost = 0;
 float debug_ycar_angle = 0.0f;
 uint8_t debug_ycar_lost = 0;
+VisionDetectionSnapshot_t vision_detection_snapshot;
+uint32_t vision_profile_camera_dt_us = 0u;
+uint32_t vision_profile_process_us = 0u;
+uint32_t vision_profile_remap_us = 0u;
+uint32_t vision_profile_blob_us = 0u;
+uint32_t vision_profile_detect_us = 0u;
+uint32_t vision_profile_display_us = 0u;
 float beacon_corr_x = 0.0f;
 float beacon_corr_y = 0.0f;
 float beacon_body_x = 0.0f;
 float beacon_body_y = 0.0f;
+float beacon_camera_x_cm = 0.0f;
+float beacon_camera_y_cm = 0.0f;
+float beacon_drone_x_cm = 0.0f;
+float beacon_drone_y_cm = 0.0f;
 float ycar_body_x = 0.0f;
 float ycar_body_y = 0.0f;
 float ycar_head_body_x = 0.0f;
@@ -30,6 +45,10 @@ float ycar_head_body_y = 0.0f;
 static uint8_t label_buf[MT9V03X_H][MT9V03X_W];
 static uint8_t beacon_lost_cnt = 0;
 static uint8_t ycar_lost_cnt = 0;
+static uint8_t vision_attitude_sync_ok = 0u;
+static uint32_t vision_attitude_time_error_us = 0u;
+static VisionBeaconCandidate_t vision_beacon_candidates[VISION_MAX_BEACON_CANDIDATES];
+static uint8_t vision_beacon_candidate_count = 0u;
 
 static void beacon_calibration_log(void)
 {
@@ -46,11 +65,11 @@ static void beacon_calibration_log(void)
 
     if(header_printed == 0u)
     {
-        printf("BCAL_HEADER,time_us,height_cm,roll_deg,pitch_deg,yaw_deg,valid,raw_x,raw_y,corr_x,corr_y,body_x_px,body_y_px,area,lost_frames,blob_count,score\r\n");
+        printf("BCAL_HEADER,time_us,height_cm,roll_deg,pitch_deg,yaw_deg,valid,raw_x,raw_y,corr_x,corr_y,body_x_px,body_y_px,camera_x_cm,camera_y_cm,drone_x_cm,drone_y_cm,area,lost_frames,blob_count,score\r\n");
         header_printed = 1u;
     }
 
-    printf("BCAL,%lu,%.2f,%.3f,%.3f,%.3f,%u,%d,%d,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%.2f\r\n",
+    printf("BCAL,%lu,%.2f,%.3f,%.3f,%.3f,%u,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%.2f\r\n",
            (unsigned long)now_us,
            vehicle_state.current_height,
            imu_data.roll,
@@ -63,13 +82,137 @@ static void beacon_calibration_log(void)
            beacon_corr_y,
            beacon_body_x,
            beacon_body_y,
+           beacon_camera_x_cm,
+           beacon_camera_y_cm,
+           beacon_drone_x_cm,
+           beacon_drone_y_cm,
            (unsigned int)beacon.area,
            (unsigned int)debug_beacon_lost,
            (unsigned int)debug_blob_cnt,
            debug_beacon_score);
 #endif
 }
+
+static void vision_test_log(void)
+{
+    static uint32_t last_log_time_us = 0u;
+    uint32_t now_us = system_time_us();
+    VisionDetectionSnapshot_t snapshot;
+    uint8_t shared_ok;
+
+    if(now_us - last_log_time_us < 200000u)
+    {
+        return;
+    }
+    last_log_time_us = now_us;
+
+    shared_ok = vision_shared_read(&snapshot);
+    if(shared_ok == 0u)
+    {
+        snapshot = vision_detection_snapshot;
+    }
+
+    printf("VTEST,shared=%u,att_sync=%u,att_dt_us=%lu,frame=%lu,frame_ts_us=%lu,cam_dt_us=%lu,proc_us=%lu,remap_us=%lu,blob_us=%lu,detect_us=%lu,display_us=%lu,blobs=%u,beacon=%u,best=%.1f,pos=(%d,%d),second=%.1f,pos=(%d,%d),margin=%.1f,ycar=%u,score=%u,pos=(%d,%d),head=(%.3f,%.3f)\r\n",
+           (unsigned int)shared_ok,
+           (unsigned int)vision_attitude_sync_ok,
+           (unsigned long)vision_attitude_time_error_us,
+           (unsigned long)snapshot.frame_id,
+           (unsigned long)snapshot.timestamp_us,
+           (unsigned long)vision_profile_camera_dt_us,
+           (unsigned long)vision_profile_process_us,
+           (unsigned long)vision_profile_remap_us,
+           (unsigned long)vision_profile_blob_us,
+           (unsigned long)vision_profile_detect_us,
+           (unsigned long)vision_profile_display_us,
+           (unsigned int)snapshot.blob_count,
+           (unsigned int)snapshot.beacon_valid,
+           snapshot.beacon_score,
+           snapshot.beacon_x,
+           snapshot.beacon_y,
+           snapshot.beacon_second_score,
+           snapshot.beacon_second_x,
+           snapshot.beacon_second_y,
+           snapshot.beacon_score - snapshot.beacon_second_score,
+           (unsigned int)snapshot.ycar_valid,
+           (unsigned int)snapshot.ycar_score,
+           snapshot.ycar_x,
+           snapshot.ycar_y,
+           snapshot.ycar_head_x,
+           snapshot.ycar_head_y);
+
+    printf("BCANDS,frame=%lu,count=%u",
+           (unsigned long)snapshot.frame_id,
+           (unsigned int)snapshot.beacon_candidate_count);
+    for(uint8_t i = 0u; i < snapshot.beacon_candidate_count; i++)
+    {
+        const VisionBeaconCandidate_t *candidate = &snapshot.beacon_candidates[i];
+        printf(",%u:(%d,%d),area=%u,bright=%u,score=%.1f",
+               (unsigned int)i,
+               candidate->x,
+               candidate->y,
+               (unsigned int)candidate->area,
+               (unsigned int)candidate->brightness,
+               candidate->score);
+    }
+    printf("\r\n");
+}
 static uint8_t ir_blob_label_to_index[128];
+
+static float beacon_candidate_base_score(const IrBlob_t *blob)
+{
+    float cx_dist = (float)(MT9V03X_W / 2 - blob->cx);
+    if(cx_dist < 0.0f) cx_dist = -cx_dist;
+
+    return (float)blob->brightness +
+           (float)blob->area * 0.5f +
+           ((float)MT9V03X_W / 2.0f - cx_dist) * 0.3f;
+}
+
+static void collect_beacon_candidates(const IrBlob_t blobs[], uint8_t blob_cnt)
+{
+    vision_beacon_candidate_count = 0u;
+    memset(vision_beacon_candidates, 0, sizeof(vision_beacon_candidates));
+
+    for(uint8_t i = 0u; i < blob_cnt; i++)
+    {
+        VisionBeaconCandidate_t candidate;
+        uint8_t insert_at;
+
+        if(!blobs[i].valid || blobs[i].type != IR_BLOB_BEACON_CANDIDATE)
+        {
+            continue;
+        }
+
+        candidate.x = blobs[i].cx;
+        candidate.y = blobs[i].cy;
+        candidate.area = blobs[i].area;
+        candidate.brightness = blobs[i].brightness;
+        candidate.score = beacon_candidate_base_score(&blobs[i]);
+
+        insert_at = vision_beacon_candidate_count;
+        if(insert_at >= VISION_MAX_BEACON_CANDIDATES)
+        {
+            insert_at = VISION_MAX_BEACON_CANDIDATES - 1u;
+            if(candidate.score <= vision_beacon_candidates[insert_at].score)
+            {
+                continue;
+            }
+        }
+        else
+        {
+            vision_beacon_candidate_count++;
+        }
+
+        while(insert_at > 0u &&
+              candidate.score > vision_beacon_candidates[insert_at - 1u].score)
+        {
+            vision_beacon_candidates[insert_at] =
+                vision_beacon_candidates[insert_at - 1u];
+            insert_at--;
+        }
+        vision_beacon_candidates[insert_at] = candidate;
+    }
+}
 
 static uint8_t ycar_label_gray(const image_t *img,
                                uint16_t area_table[],
@@ -81,6 +224,23 @@ static void image_point_to_body_offset(float img_x, float img_y,
 {
     *body_x = IMAGE_CENTER_Y - img_y;
     *body_y = img_x - IMAGE_CENTER_X;
+}
+
+static void beacon_update_metric_position_with_height(float height_cm)
+{
+    if(height_cm <= 0.0f)
+    {
+        beacon_camera_x_cm = 0.0f;
+        beacon_camera_y_cm = 0.0f;
+        beacon_drone_x_cm = 0.0f;
+        beacon_drone_y_cm = 0.0f;
+        return;
+    }
+
+    beacon_camera_x_cm = beacon_body_x * height_cm * BEACON_SCALE_X;
+    beacon_camera_y_cm = beacon_body_y * height_cm * BEACON_SCALE_Y;
+    beacon_drone_x_cm = beacon_camera_x_cm + CAMERA_OFFSET_BODY_X_CM;
+    beacon_drone_y_cm = beacon_camera_y_cm + CAMERA_OFFSET_BODY_Y_CM;
 }
 
 static void image_vector_to_body_vector(float img_x, float img_y,
@@ -310,11 +470,16 @@ void classify_ir_blobs(IrBlob_t blobs[], uint8_t blob_cnt)
     }
 }
 
-void detect_beacon_from_ir_blobs(const IrBlob_t blobs[], uint8_t blob_cnt, BeaconInfo *info)
+void detect_beacon_from_ir_blobs(const IrBlob_t blobs[], uint8_t blob_cnt,
+                                 float roll_deg, float pitch_deg,
+                                 BeaconInfo *info)
 {
     uint8_t best = 0;
     uint8_t found = 0;
     float best_score = -100000.0f;
+    float second_score = -100000.0f;
+    int16_t second_x = 0;
+    int16_t second_y = 0;
     static int16_t prev_cx = -1;
     static int16_t prev_cy = -1;
     static int16_t filt_cx = -1;
@@ -329,34 +494,43 @@ void detect_beacon_from_ir_blobs(const IrBlob_t blobs[], uint8_t blob_cnt, Beaco
     for(uint8_t i = 0; i < blob_cnt; i++)
     {
         float score;
-        float cx_dist;
-
         if(!blobs[i].valid || blobs[i].type != IR_BLOB_BEACON_CANDIDATE) continue;
 
-        score = (float)blobs[i].brightness;
-        score += (float)blobs[i].area * 0.5f;
-
-        cx_dist = (float)(MT9V03X_W / 2 - blobs[i].cx);
-        if(cx_dist < 0.0f) cx_dist = -cx_dist;
-        score += ((float)MT9V03X_W / 2.0f - cx_dist) * 0.3f;
+        score = beacon_candidate_base_score(&blobs[i]);
 
         if(prev_cx >= 0)
         {
             float dx = (float)(blobs[i].cx - prev_cx);
             float dy = (float)(blobs[i].cy - prev_cy);
-            score += (200.0f - (dx * dx + dy * dy)) * 0.2f;
+            float dist2 = dx * dx + dy * dy;
+            score += 40.0f / (1.0f + dist2 / 100.0f);
         }
 
         if(!found || score > best_score)
         {
+            if(found)
+            {
+                second_score = best_score;
+                second_x = blobs[best].cx;
+                second_y = blobs[best].cy;
+            }
             found = 1;
             best_score = score;
             best = i;
+        }
+        else if(score > second_score)
+        {
+            second_score = score;
+            second_x = blobs[i].cx;
+            second_y = blobs[i].cy;
         }
     }
 
     debug_blob_cnt = blob_cnt;
     debug_beacon_score = found ? best_score : 0.0f;
+    debug_beacon_second_score = (second_score > -99999.0f) ? second_score : 0.0f;
+    debug_beacon_second_x = second_x;
+    debug_beacon_second_y = second_y;
 
     if(found)
     {
@@ -387,12 +561,14 @@ void detect_beacon_from_ir_blobs(const IrBlob_t blobs[], uint8_t blob_cnt, Beaco
         prev_cx = filt_cx;
         prev_cy = filt_cy;
 
-        vision_attitude_compensation((float)info->centerX, (float)info->centerY,
-                                     &u_corr, &v_corr);
+        vision_attitude_compensation_with_attitude(
+            (float)info->centerX, (float)info->centerY,
+            roll_deg, pitch_deg, &u_corr, &v_corr);
         beacon_corr_x = u_corr;
         beacon_corr_y = v_corr;
         image_point_to_body_offset(beacon_corr_x, beacon_corr_y,
                                    &beacon_body_x, &beacon_body_y);
+        beacon_update_metric_position_with_height(vehicle_state.current_height);
 
         erro = 1.0f * (MT9V03X_W / 2 - u_corr);
         last_erro = erro;
@@ -555,6 +731,7 @@ void ycar_detect_from_ir_blobs(const image_t *img, const IrBlob_t blobs[], uint8
     info->cy = 0;
     info->hx = 0.0f;
     info->hy = 0.0f;
+    info->score = 0u;
 
     memset(best_keep, 0, sizeof(best_keep));
 
@@ -630,6 +807,7 @@ void ycar_detect_from_ir_blobs(const image_t *img, const IrBlob_t blobs[], uint8
     }
 
     if(best_score == 0) return;
+    info->score = best_score;
     memcpy(keep, best_keep, sizeof(keep));
 
     for(int y = 0; y < img->height; y++)
@@ -816,6 +994,7 @@ void ycar_detect_gray(const image_t *img, YCarInfo_t *info)
     info->cy = 0;
     info->hx = 0.0f;
     info->hy = 0.0f;
+    info->score = 0u;
 
     labels = ycar_label_gray(img, area_tbl, minx, maxx, miny, maxy);
     if(labels == 0) return;
@@ -884,6 +1063,7 @@ void ycar_detect_gray(const image_t *img, YCarInfo_t *info)
     }
 
     if(best_score == 0) return;
+    info->score = best_score;
     memcpy(keep, best_keep, sizeof(keep));
 
     for(int y = 0; y < img->height; y++)
@@ -1079,7 +1259,8 @@ void detect_beacon(image_t *img, BeaconInfo *info)
     IrBlob_t blobs[MAX_IR_BLOBS];
     uint8_t blob_cnt = ir_find_blobs_gray(img, blobs, MAX_IR_BLOBS);
     classify_ir_blobs(blobs, blob_cnt);
-    detect_beacon_from_ir_blobs(blobs, blob_cnt, info);
+    detect_beacon_from_ir_blobs(blobs, blob_cnt,
+                                imu_data.roll, imu_data.pitch, info);
 }
 
 bool visited[MT9V03X_H][MT9V03X_W] = {false};
@@ -1200,21 +1381,25 @@ uint16_t find_centers(const image_t *img, CenterPoint centers[MAX_CENTERS])
 // 将倾斜画面中的像素，映射回一个"完美的虚拟水平相机"画面上。
 // 输入：
 //   - u_raw, v_raw: 图像处理算法识别到的、歪斜画面里的原始信标中心像素坐标。
-//   - drone_roll: IMU / AHRS 算出的飞机当前横滚角 (单位：弧度！绝对不准用角度！)。
-//   - drone_pitch: IMU / AHRS 算出的飞机当前俯仰角 (单位：弧度！绝对不准用角度！)。
+//   - roll_deg: 图像采集时刻的横滚角，单位为度。
+//   - pitch_deg: 图像采集时刻的俯仰角，单位为度。
 // 输出：
 //   - u_corr, v_corr: 指针，返回矫正后的、无姿态耦合的"上帝视角"坐标。
-void vision_attitude_compensation(float u_raw, float v_raw, float *u_corr, float *v_corr)
+void vision_attitude_compensation_with_attitude(float u_raw, float v_raw,
+                                                 float roll_deg, float pitch_deg,
+                                                 float *u_corr, float *v_corr)
 {
     // ==========================================
     // 步骤一：预计算 sin 和 cos 
     // ==========================================
     // 将角度转换为弧度的方法：(角度 * 3.14159f / 180.0f)
     // 确保 Roll > 0 代表右翼下倾；Pitch > 0 代表机头抬起。
-    float cr = vehicle_state.roll_cos;
-    float sr = vehicle_state.roll_sin;
-    float cp = vehicle_state.pitch_cos;
-    float sp = vehicle_state.pitch_sin;
+    float roll_rad = roll_deg * 3.1415926f / 180.0f;
+    float pitch_rad = pitch_deg * 3.1415926f / 180.0f;
+    float cr = cosf(roll_rad);
+    float sr = sinf(roll_rad);
+    float cp = cosf(pitch_rad);
+    float sp = sinf(pitch_rad);
 
     // ==========================================
     // 步骤二：图像坐标系 -> 相机3D射线向量 (Pc)
@@ -1254,21 +1439,73 @@ void vision_attitude_compensation(float u_raw, float v_raw, float *u_corr, float
     *v_corr = IMAGE_CENTER_Y + CAMERA_FOCAL_LENGTH_PIXEL * (Yg / Zg);
 }
 
+void vision_attitude_compensation(float u_raw, float v_raw,
+                                  float *u_corr, float *v_corr)
+{
+    vision_attitude_compensation_with_attitude(
+        u_raw, v_raw, imu_data.roll, imu_data.pitch, u_corr, v_corr);
+}
+
 uint8_t image_process()
 {
     IrBlob_t ir_blobs[MAX_IR_BLOBS];
     YCarInfo_t ycar_frame;
     mcar_guidance_t mcar_guidance;
     uint8_t ir_blob_cnt;
+    uint32_t frame_timestamp_us;
+    AttitudeHistorySample_t frame_attitude;
+    static uint32_t last_frame_timestamp_us = 0u;
+    uint32_t process_start_us;
+    uint32_t stage_start_us;
 
+    mcar_comm_poll();
+
+    if(mt9v03x_finish_flag == 0u)
+    {
+        return 0u;
+    }
+    mt9v03x_finish_flag = 0u;
+    frame_timestamp_us = mt9v03x_frame_timestamp_us;
+    process_start_us = system_time_us();
+    if(last_frame_timestamp_us != 0u)
+    {
+        vision_profile_camera_dt_us = frame_timestamp_us - last_frame_timestamp_us;
+    }
+    last_frame_timestamp_us = frame_timestamp_us;
+
+    vision_attitude_sync_ok = attitude_history_find_nearest(
+        frame_timestamp_us, &frame_attitude, &vision_attitude_time_error_us);
+    if(vision_attitude_sync_ok == 0u ||
+       vision_attitude_time_error_us > 10000u)
+    {
+        vision_attitude_sync_ok = 0u;
+        frame_attitude.roll_deg = imu_data.roll;
+        frame_attitude.pitch_deg = imu_data.pitch;
+        frame_attitude.yaw_deg = imu_data.yaw;
+    }
+
+    stage_start_us = system_time_us();
     memcpy(base_image, mt9v03x_image, MT9V03X_IMAGE_SIZE); // 将采集到的图像数据复制到 base_image 中
     image_remap8(&base_img, &undistorted_img, &mapx_img, &mapy_img); // 去畸变重映射
+    vision_profile_remap_us = system_time_us() - stage_start_us;
 
+    stage_start_us = system_time_us();
     ir_blob_cnt = ir_find_blobs_gray(&undistorted_img, ir_blobs, MAX_IR_BLOBS);
     classify_ir_blobs(ir_blobs, ir_blob_cnt);
+    collect_beacon_candidates(ir_blobs, ir_blob_cnt);
+    vision_profile_blob_us = system_time_us() - stage_start_us;
 
-    detect_beacon_from_ir_blobs(ir_blobs, ir_blob_cnt, &beacon);
+    stage_start_us = system_time_us();
+    detect_beacon_from_ir_blobs(ir_blobs, ir_blob_cnt,
+                                frame_attitude.roll_deg,
+                                frame_attitude.pitch_deg,
+                                &beacon);
+#if YCAR_DETECTION_ENABLE
     ycar_detect_from_ir_blobs(&undistorted_img, ir_blobs, ir_blob_cnt, &ycar_frame);
+#else
+    memset(&ycar_frame, 0, sizeof(ycar_frame));
+#endif
+    vision_profile_detect_us = system_time_us() - stage_start_us;
 
         if (ycar_frame.valid)
         {
@@ -1281,11 +1518,15 @@ uint8_t image_process()
             ycar_lost_cnt = 0;
             debug_ycar_lost = 0;
             debug_ycar_angle = atan2f(ycar_info.hy, ycar_info.hx) * 57.29578f;
-            vision_attitude_compensation((float)ycar_info.cx, (float)ycar_info.cy,
-                                         &mcar_corr_x, &mcar_corr_y);
-            vision_attitude_compensation((float)ycar_info.cx + ycar_info.hx * 16.0f,
-                                         (float)ycar_info.cy + ycar_info.hy * 16.0f,
-                                         &mcar_head_corr_x, &mcar_head_corr_y);
+            vision_attitude_compensation_with_attitude(
+                (float)ycar_info.cx, (float)ycar_info.cy,
+                frame_attitude.roll_deg, frame_attitude.pitch_deg,
+                &mcar_corr_x, &mcar_corr_y);
+            vision_attitude_compensation_with_attitude(
+                (float)ycar_info.cx + ycar_info.hx * 16.0f,
+                (float)ycar_info.cy + ycar_info.hy * 16.0f,
+                frame_attitude.roll_deg, frame_attitude.pitch_deg,
+                &mcar_head_corr_x, &mcar_head_corr_y);
             image_point_to_body_offset(mcar_corr_x, mcar_corr_y,
                                        &ycar_body_x, &ycar_body_y);
             image_vector_to_body_vector(mcar_head_corr_x - mcar_corr_x,
@@ -1343,10 +1584,40 @@ uint8_t image_process()
             draw_o(&undistorted_img, (int)beacon_corr_x, (int)beacon_corr_y, 6, 128); // 解耦坐标画个灰色的 'O'
         }
 
+    {
+        static uint32_t frame_id = 0u;
+
+        vision_detection_snapshot.timestamp_us = frame_timestamp_us;
+        vision_detection_snapshot.blob_count = ir_blob_cnt;
+        vision_detection_snapshot.beacon_valid = (beacon.status == BEACON_FOUND);
+        vision_detection_snapshot.ycar_valid = ycar_frame.valid;
+        vision_detection_snapshot.beacon_candidate_count = vision_beacon_candidate_count;
+        vision_detection_snapshot.beacon_score = debug_beacon_score;
+        vision_detection_snapshot.beacon_second_score = debug_beacon_second_score;
+        vision_detection_snapshot.ycar_score = ycar_frame.score;
+        vision_detection_snapshot.beacon_x = beacon.centerX;
+        vision_detection_snapshot.beacon_y = beacon.centerY;
+        vision_detection_snapshot.beacon_second_x = debug_beacon_second_x;
+        vision_detection_snapshot.beacon_second_y = debug_beacon_second_y;
+        vision_detection_snapshot.ycar_x = ycar_frame.cx;
+        vision_detection_snapshot.ycar_y = ycar_frame.cy;
+        vision_detection_snapshot.ycar_head_x = ycar_frame.hx;
+        vision_detection_snapshot.ycar_head_y = ycar_frame.hy;
+        memcpy(vision_detection_snapshot.beacon_candidates,
+               vision_beacon_candidates,
+               sizeof(vision_beacon_candidates));
+        vision_detection_snapshot.frame_id = ++frame_id;
+        vision_shared_publish(&vision_detection_snapshot);
+    }
+
+    vision_test_log();
     beacon_calibration_log();
 
+    vision_nav_update();
+
     mcar_guidance.valid = 0u;
-    if(beacon.status == BEACON_FOUND && ycar_info.valid)
+    if(YCAR_GUIDANCE_ENABLE &&
+       beacon.status == BEACON_FOUND && ycar_info.valid)
     {
         mcar_guidance = mcar_guidance_calculate(beacon_body_x, beacon_body_y,
                                                 ycar_body_x, ycar_body_y,
@@ -1354,30 +1625,173 @@ uint8_t image_process()
                                                 imu_data.yaw);
     }
 
-    if(mcar_guidance.valid)
+    if(mcar_guidance.valid && vision_nav_target_active())
     {
         uint8 flags = MCAR_COMM_FLAG_BEACON_VALID |
                       MCAR_COMM_FLAG_MCAR_VALID |
-                      MCAR_COMM_FLAG_YAW_VALID;
+                      MCAR_COMM_FLAG_YAW_VALID |
+                      MCAR_COMM_FLAG_TARGET_ACTIVE;
         if(debug_beacon_lost != 0u || debug_ycar_lost != 0u)
         {
             flags |= MCAR_COMM_FLAG_OBS_HELD;
         }
 
-        mcar_comm_send_target(mcar_guidance.err_forward_px,
+        mcar_comm_send_target(vision_nav_target_seq(),
+                              mcar_guidance.err_forward_px,
                               mcar_guidance.err_right_px,
                               mcar_guidance.mcar_yaw_earth_cdeg,
                               flags);
     }
     else
     {
-        uint8 flags = 0u;
+        uint8 flags = MCAR_COMM_FLAG_STOP;
         if(beacon.status == BEACON_FOUND) flags |= MCAR_COMM_FLAG_BEACON_VALID;
         if(ycar_info.valid) flags |= MCAR_COMM_FLAG_MCAR_VALID;
-        mcar_comm_send_target(0, 0, 0, flags);
+        mcar_comm_send_target(vision_nav_target_seq(), 0, 0, 0, flags);
     }
 
-    vision_nav_update();
-
+    vision_profile_process_us = system_time_us() - process_start_us;
     return 1;
+}
+
+uint8_t vision_consumer_update(void)
+{
+    static uint32_t last_frame_id = 0u;
+    static uint32_t last_frame_rx_us = 0u;
+    static uint8_t stale_reported = 0u;
+    VisionDetectionSnapshot_t snapshot;
+    mcar_guidance_t guidance = {0};
+    uint32_t now_us = system_time_us();
+    uint8_t have_new_frame = 0u;
+
+    mcar_comm_poll();
+    if(vision_shared_read(&snapshot) && snapshot.frame_id != last_frame_id)
+    {
+        float frame_roll = snapshot.frame_roll_deg;
+        float frame_pitch = snapshot.frame_pitch_deg;
+        float frame_yaw = snapshot.frame_yaw_deg;
+        float frame_height = snapshot.frame_height_cm;
+
+        have_new_frame = 1u;
+        stale_reported = 0u;
+        last_frame_id = snapshot.frame_id;
+        last_frame_rx_us = now_us;
+        vision_detection_snapshot = snapshot;
+        if(snapshot.attitude_generation != 0u)
+        {
+            vision_attitude_time_error_us =
+                (snapshot.timestamp_us >= snapshot.attitude_timestamp_us) ?
+                snapshot.timestamp_us - snapshot.attitude_timestamp_us :
+                snapshot.attitude_timestamp_us - snapshot.timestamp_us;
+        }
+        else
+        {
+            vision_attitude_time_error_us = 0u;
+        }
+        vision_attitude_sync_ok = (snapshot.attitude_generation != 0u &&
+                                   vision_attitude_time_error_us <= 10000u) ? 1u : 0u;
+        debug_blob_cnt = snapshot.blob_count;
+        debug_beacon_score = snapshot.beacon_score;
+        debug_beacon_second_score = snapshot.beacon_second_score;
+        debug_beacon_second_x = snapshot.beacon_second_x;
+        debug_beacon_second_y = snapshot.beacon_second_y;
+
+        if(snapshot.beacon_valid && vision_attitude_sync_ok)
+        {
+            beacon.status = BEACON_FOUND;
+            beacon.centerX = snapshot.beacon_x;
+            beacon.centerY = snapshot.beacon_y;
+            beacon.area = (snapshot.beacon_candidate_count > 0u) ?
+                          snapshot.beacon_candidates[0].area : 0u;
+            beacon_lost_cnt = 0u;
+            debug_beacon_lost = 0u;
+            vision_attitude_compensation_with_attitude(
+                (float)beacon.centerX, (float)beacon.centerY,
+                frame_roll, frame_pitch, &beacon_corr_x, &beacon_corr_y);
+            image_point_to_body_offset(beacon_corr_x, beacon_corr_y,
+                                       &beacon_body_x, &beacon_body_y);
+            beacon_update_metric_position_with_height(frame_height);
+        }
+        else
+        {
+            beacon.status = BEACON_NOT_FOUND;
+            if(beacon_lost_cnt < 255u) beacon_lost_cnt++;
+            debug_beacon_lost = beacon_lost_cnt;
+        }
+
+        if(snapshot.ycar_valid && vision_attitude_sync_ok)
+        {
+            float center_x;
+            float center_y;
+            float head_x;
+            float head_y;
+            ycar_info.valid = 1u;
+            ycar_info.cx = snapshot.ycar_x;
+            ycar_info.cy = snapshot.ycar_y;
+            ycar_info.hx = snapshot.ycar_head_x;
+            ycar_info.hy = snapshot.ycar_head_y;
+            ycar_info.score = snapshot.ycar_score;
+            vision_attitude_compensation_with_attitude(
+                ycar_info.cx, ycar_info.cy, frame_roll, frame_pitch,
+                &center_x, &center_y);
+            vision_attitude_compensation_with_attitude(
+                ycar_info.cx + ycar_info.hx * 16.0f,
+                ycar_info.cy + ycar_info.hy * 16.0f,
+                frame_roll, frame_pitch, &head_x, &head_y);
+            image_point_to_body_offset(center_x, center_y,
+                                       &ycar_body_x, &ycar_body_y);
+            image_vector_to_body_vector(head_x - center_x, head_y - center_y,
+                                        &ycar_head_body_x, &ycar_head_body_y);
+            ycar_lost_cnt = 0u;
+            debug_ycar_lost = 0u;
+        }
+        else
+        {
+            if(ycar_lost_cnt < 255u) ycar_lost_cnt++;
+            debug_ycar_lost = ycar_lost_cnt;
+            if(ycar_lost_cnt > YCAR_LOST_HOLD) ycar_info.valid = 0u;
+        }
+
+        //vision_test_log();
+        //beacon_calibration_log();
+        vision_nav_update();
+
+        if(YCAR_GUIDANCE_ENABLE &&
+           beacon.status == BEACON_FOUND && ycar_info.valid)
+        {
+            guidance = mcar_guidance_calculate(
+                beacon_body_x, beacon_body_y, ycar_body_x, ycar_body_y,
+                ycar_head_body_x, ycar_head_body_y, frame_yaw);
+        }
+
+        if(guidance.valid && vision_nav_target_active())
+        {
+            uint8 flags = MCAR_COMM_FLAG_BEACON_VALID |
+                          MCAR_COMM_FLAG_MCAR_VALID |
+                          MCAR_COMM_FLAG_YAW_VALID |
+                          MCAR_COMM_FLAG_TARGET_ACTIVE;
+            mcar_comm_send_target(vision_nav_target_seq(),
+                                  guidance.err_forward_px,
+                                  guidance.err_right_px,
+                                  guidance.mcar_yaw_earth_cdeg, flags);
+        }
+        else
+        {
+            uint8 flags = MCAR_COMM_FLAG_STOP;
+            if(beacon.status == BEACON_FOUND) flags |= MCAR_COMM_FLAG_BEACON_VALID;
+            if(ycar_info.valid) flags |= MCAR_COMM_FLAG_MCAR_VALID;
+            mcar_comm_send_target(vision_nav_target_seq(), 0, 0, 0, flags);
+        }
+    }
+    else if(last_frame_rx_us != 0u &&
+            now_us - last_frame_rx_us > 120000u && !stale_reported)
+    {
+        stale_reported = 1u;
+        beacon.status = BEACON_NOT_FOUND;
+        ycar_info.valid = 0u;
+        vision_nav_update();
+        mcar_comm_send_stop(vision_nav_target_seq());
+    }
+
+    return have_new_frame;
 }

@@ -1,16 +1,10 @@
 #include "vision_nav.h"
 #include "beacon.h"
 #include "ekf_lite.h"
+#include "mcar_comm.h"
 #include "param.h"
 
 vision_nav_obs_t vision_nav_obs = {0};
-uint8_t vision_nav_current_beacon_id = 0;
-
-static const vision_nav_point_t vision_nav_beacon_map[VISION_NAV_BEACON_COUNT] = {
-    {0.0f, 0.0f},
-    {100.0f, 0.0f},
-    {200.0f, 0.0f},
-};
 
 static float vision_nav_absf(float value)
 {
@@ -24,6 +18,151 @@ static float vision_nav_clampf(float value, float min_value, float max_value)
     return value;
 }
 
+static void vision_nav_fast_search_update(uint8_t geometry_ok)
+{
+#if VISION_NAV_FAST_SEARCH_ENABLE
+    uint8_t eligible = ((vehicle_state.armed != 0u) &&
+                        (vehicle_state.flight_mode == FLY_AUTOFLY) &&
+                        (vehicle_state.flow_valid != 0u) &&
+                        (vehicle_state.current_height >=
+                         VISION_NAV_SEARCH_MIN_HEIGHT_CM) &&
+                        (vision_nav_obs.car_arrived == 0u)) ? 1u : 0u;
+
+    if(eligible == 0u)
+    {
+        vision_nav_obs.search_move_active = 0u;
+        vision_nav_obs.search_lost_frames = 0u;
+        vision_nav_obs.search_found_frames = 0u;
+        return;
+    }
+
+    if(geometry_ok != 0u)
+    {
+        vision_nav_obs.search_lost_frames = 0u;
+        if(vision_nav_obs.search_found_frames < 255u)
+        {
+            vision_nav_obs.search_found_frames++;
+        }
+
+        if((vision_nav_obs.search_move_active != 0u) &&
+           (vision_nav_obs.search_found_frames >=
+            VISION_NAV_SEARCH_REACQUIRE_FRAMES))
+        {
+            vision_nav_obs.search_move_active = 0u;
+            vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
+            vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+            vehicle_setpoint.target_vel_x = 0.0f;
+            vehicle_setpoint.target_vel_y = 0.0f;
+        }
+    }
+    else
+    {
+        vision_nav_obs.search_found_frames = 0u;
+        if(vision_nav_obs.search_lost_frames < 255u)
+        {
+            vision_nav_obs.search_lost_frames++;
+        }
+        if(vision_nav_obs.search_lost_frames >= VISION_NAV_SEARCH_LOST_FRAMES)
+        {
+            vision_nav_obs.search_move_active = 1u;
+        }
+    }
+
+    if(vision_nav_obs.search_move_active != 0u)
+    {
+        vehicle_setpoint.target_pos_x = VISION_NAV_SEARCH_CENTER_X_CM;
+        vehicle_setpoint.target_pos_y = VISION_NAV_SEARCH_CENTER_Y_CM;
+        vehicle_setpoint.target_vel_x = 0.0f;
+        vehicle_setpoint.target_vel_y = 0.0f;
+    }
+#else
+    (void)geometry_ok;
+#endif
+}
+
+static uint8_t vision_nav_geometry_ok(void)
+{
+    if(beacon.status != BEACON_FOUND) return 0u;
+    if(vehicle_state.current_height < VISION_NAV_MIN_HEIGHT_CM) return 0u;
+    if(vehicle_state.current_height > VISION_NAV_MAX_HEIGHT_CM) return 0u;
+    if(vision_nav_absf(vehicle_state.current_roll) > VISION_NAV_MAX_ATT_DEG) return 0u;
+    if(vision_nav_absf(vehicle_state.current_pitch) > VISION_NAV_MAX_ATT_DEG) return 0u;
+    return 1u;
+}
+
+static void vision_nav_clear_measurement(void)
+{
+    vision_nav_obs.valid = 0u;
+    vision_nav_obs.used_for_ekf = 0u;
+    vision_nav_obs.confidence = 0.0f;
+    vision_nav_obs.drone_x_cm = 0.0f;
+    vision_nav_obs.drone_y_cm = 0.0f;
+    vision_nav_obs.rel_earth_x_cm = 0.0f;
+    vision_nav_obs.rel_earth_y_cm = 0.0f;
+    vision_nav_obs.observed_beacon_x_cm = 0.0f;
+    vision_nav_obs.observed_beacon_y_cm = 0.0f;
+    vision_nav_obs.residual_x_cm = 0.0f;
+    vision_nav_obs.residual_y_cm = 0.0f;
+    vision_nav_obs.ekf_correction_x_cm = 0.0f;
+    vision_nav_obs.ekf_correction_y_cm = 0.0f;
+}
+
+static void vision_nav_start_search(void)
+{
+    vision_nav_obs.state = VISION_NAV_SEARCH;
+    vision_nav_obs.anchor_valid = 0u;
+    vision_nav_obs.car_arrived = 0u;
+    vision_nav_obs.target_done = 0u;
+    vision_nav_obs.stable_frames = 0u;
+    vision_nav_obs.lost_since_us = 0u;
+}
+
+static void vision_nav_begin_target(float beacon_x, float beacon_y)
+{
+    vision_nav_obs.target_seq++;
+    if(vision_nav_obs.target_seq == 0u) vision_nav_obs.target_seq = 1u;
+    vision_nav_obs.anchor_x_cm = beacon_x;
+    vision_nav_obs.anchor_y_cm = beacon_y;
+    vision_nav_obs.anchor_valid = 1u;
+    vision_nav_obs.car_arrived = 0u;
+    vision_nav_obs.target_done = 0u;
+    vision_nav_obs.state = VISION_NAV_TRACKING;
+    vision_nav_obs.lost_since_us = 0u;
+}
+
+static void vision_nav_apply_ekf(float residual_x, float residual_y,
+                                 float confidence)
+{
+#if VISION_NAV_ENABLE_EKF_UPDATE
+    float r = 1600.0f / vision_nav_clampf(confidence, 0.25f, 1.0f);
+    float kx = ekf_lite_p_xy[0] / (ekf_lite_p_xy[0] + r);
+    float ky = ekf_lite_p_xy[1] / (ekf_lite_p_xy[1] + r);
+    float correction_x = kx * residual_x;
+    float correction_y = ky * residual_y;
+
+    correction_x = vision_nav_clampf(correction_x,
+        -VISION_NAV_MAX_EKF_CORRECTION_CM, VISION_NAV_MAX_EKF_CORRECTION_CM);
+    correction_y = vision_nav_clampf(correction_y,
+        -VISION_NAV_MAX_EKF_CORRECTION_CM, VISION_NAV_MAX_EKF_CORRECTION_CM);
+
+    ekf_lite_state.x += correction_x;
+    ekf_lite_state.y += correction_y;
+    if(vision_nav_absf(residual_x) > 0.001f) kx = vision_nav_absf(correction_x / residual_x);
+    if(vision_nav_absf(residual_y) > 0.001f) ky = vision_nav_absf(correction_y / residual_y);
+    ekf_lite_p_xy[0] *= (1.0f - vision_nav_clampf(kx, 0.0f, 1.0f));
+    ekf_lite_p_xy[1] *= (1.0f - vision_nav_clampf(ky, 0.0f, 1.0f));
+    vehicle_state.current_pos_x = ekf_lite_state.x;
+    vehicle_state.current_pos_y = ekf_lite_state.y;
+    vision_nav_obs.ekf_correction_x_cm = correction_x;
+    vision_nav_obs.ekf_correction_y_cm = correction_y;
+    vision_nav_obs.used_for_ekf = 1u;
+#else
+    (void)residual_x;
+    (void)residual_y;
+    (void)confidence;
+#endif
+}
+
 void vision_nav_init(void)
 {
     vision_nav_reset();
@@ -32,139 +171,214 @@ void vision_nav_init(void)
 void vision_nav_reset(void)
 {
     memset(&vision_nav_obs, 0, sizeof(vision_nav_obs));
-    vision_nav_current_beacon_id = 0;
+    vision_nav_start_search();
 }
 
-void vision_nav_set_current_beacon(uint8_t beacon_id)
+uint8_t vision_nav_target_active(void)
 {
-    if(beacon_id < VISION_NAV_BEACON_COUNT)
-    {
-        vision_nav_current_beacon_id = beacon_id;
-        vision_nav_obs.stable_frames = 0;
-    }
+    return (vision_nav_obs.state == VISION_NAV_TRACKING ||
+            vision_nav_obs.state == VISION_NAV_CAR_ARRIVED) ? 1u : 0u;
 }
 
-void vision_nav_next_beacon(void)
+uint8_t vision_nav_target_seq(void)
 {
-    if((vision_nav_current_beacon_id + 1u) < VISION_NAV_BEACON_COUNT)
-    {
-        vision_nav_current_beacon_id++;
-        vision_nav_obs.stable_frames = 0;
-    }
-}
-
-static uint8_t vision_nav_gate_ok(float residual_x, float residual_y)
-{
-    if(beacon.status != BEACON_FOUND) return 0u;
-    if(vehicle_state.current_height < VISION_NAV_MIN_HEIGHT_CM) return 0u;
-    if(vehicle_state.current_height > VISION_NAV_MAX_HEIGHT_CM) return 0u;
-    if(vision_nav_absf(vehicle_state.current_roll) > VISION_NAV_MAX_ATT_DEG) return 0u;
-    if(vision_nav_absf(vehicle_state.current_pitch) > VISION_NAV_MAX_ATT_DEG) return 0u;
-    if(vision_nav_absf(residual_x) > VISION_NAV_MAX_RESIDUAL_CM) return 0u;
-    if(vision_nav_absf(residual_y) > VISION_NAV_MAX_RESIDUAL_CM) return 0u;
-    return 1u;
-}
-
-static void vision_nav_update_ekf_xy(float meas_x, float meas_y, float confidence)
-{
-#if VISION_NAV_ENABLE_EKF_UPDATE
-    float r = 900.0f / vision_nav_clampf(confidence, 0.25f, 1.0f);
-    float innov_x = meas_x - ekf_lite_state.x;
-    float innov_y = meas_y - ekf_lite_state.y;
-    float kx = ekf_lite_p_xy[0] / (ekf_lite_p_xy[0] + r);
-    float ky = ekf_lite_p_xy[1] / (ekf_lite_p_xy[1] + r);
-
-    ekf_lite_state.x += kx * innov_x;
-    ekf_lite_state.y += ky * innov_y;
-    ekf_lite_p_xy[0] *= (1.0f - kx);
-    ekf_lite_p_xy[1] *= (1.0f - ky);
-    vehicle_state.current_pos_x = ekf_lite_state.x;
-    vehicle_state.current_pos_y = ekf_lite_state.y;
-#else
-    (void)meas_x;
-    (void)meas_y;
-    (void)confidence;
-#endif
+    return vision_nav_obs.target_seq;
 }
 
 void vision_nav_update(void)
 {
-    const vision_nav_point_t *target = &vision_nav_beacon_map[vision_nav_current_beacon_id];
-    float rel_x_e;
-    float rel_y_e;
-    float drone_x;
-    float drone_y;
-    float residual_x;
-    float residual_y;
-    float confidence;
-    uint8_t gate_ok;
+    float rel_x_e = 0.0f;
+    float rel_y_e = 0.0f;
+    float observed_beacon_x = 0.0f;
+    float observed_beacon_y = 0.0f;
+    float jump_x;
+    float jump_y;
+    uint32_t now_us = system_time_us();
+    uint8_t geometry_ok = vision_nav_geometry_ok();
+    uint8_t feedback_fresh = mcar_comm_feedback_is_fresh(
+        vision_nav_obs.target_seq, VISION_NAV_MCAR_FEEDBACK_TIMEOUT_US);
 
-    vision_nav_obs.valid = 0u;
-    vision_nav_obs.used_for_ekf = 0u;
-    vision_nav_obs.beacon_id = vision_nav_current_beacon_id;
+    vision_nav_clear_measurement();
+    vision_nav_obs.geometry_ok = geometry_ok;
+    vision_nav_obs.feedback_fresh = feedback_fresh;
 
-    if(vision_nav_current_beacon_id >= VISION_NAV_BEACON_COUNT)
+    if(feedback_fresh &&
+       (mcar_comm_feedback.status & MCAR_COMM_STATUS_ARRIVED) != 0u &&
+       vision_nav_absf((float)mcar_comm_feedback.err_forward_px) <= VISION_NAV_MCAR_ARRIVE_ERR_PX &&
+       vision_nav_absf((float)mcar_comm_feedback.err_right_px) <= VISION_NAV_MCAR_ARRIVE_ERR_PX)
     {
-        vision_nav_obs.stable_frames = 0u;
-        return;
-    }
-
-    rel_x_e = beacon_body_x * vehicle_state.yaw_cos -
-              beacon_body_y * vehicle_state.yaw_sin;
-    rel_y_e = beacon_body_x * vehicle_state.yaw_sin +
-              beacon_body_y * vehicle_state.yaw_cos;
-
-    drone_x = target->x_cm - rel_x_e;
-    drone_y = target->y_cm - rel_y_e;
-    residual_x = drone_x - ekf_lite_state.x;
-    residual_y = drone_y - ekf_lite_state.y;
-
-    gate_ok = vision_nav_gate_ok(residual_x, residual_y);
-    if(gate_ok)
-    {
-        if(vision_nav_obs.stable_frames < 255u)
+        vision_nav_obs.car_arrived = 1u;
+        if(vision_nav_obs.state == VISION_NAV_TRACKING)
         {
-            vision_nav_obs.stable_frames++;
+            vision_nav_obs.state = VISION_NAV_CAR_ARRIVED;
         }
     }
-    else
+
+    vision_nav_fast_search_update(geometry_ok);
+
+    if(geometry_ok)
     {
-        vision_nav_obs.stable_frames = 0u;
+        rel_x_e = beacon_drone_x_cm * vehicle_state.yaw_cos -
+                  beacon_drone_y_cm * vehicle_state.yaw_sin;
+        rel_y_e = beacon_drone_x_cm * vehicle_state.yaw_sin +
+                  beacon_drone_y_cm * vehicle_state.yaw_cos;
+        observed_beacon_x = ekf_lite_state.x + rel_x_e;
+        observed_beacon_y = ekf_lite_state.y + rel_y_e;
+        vision_nav_obs.rel_earth_x_cm = rel_x_e;
+        vision_nav_obs.rel_earth_y_cm = rel_y_e;
+        vision_nav_obs.observed_beacon_x_cm = observed_beacon_x;
+        vision_nav_obs.observed_beacon_y_cm = observed_beacon_y;
+
+        if(vision_nav_obs.state == VISION_NAV_DONE)
+        {
+            vision_nav_start_search();
+        }
+
+        if(vision_nav_obs.state == VISION_NAV_SEARCH)
+        {
+            if(vision_nav_obs.stable_frames == 0u)
+            {
+                vision_nav_obs.pending_anchor_x_cm = observed_beacon_x;
+                vision_nav_obs.pending_anchor_y_cm = observed_beacon_y;
+                vision_nav_obs.stable_frames = 1u;
+            }
+            else
+            {
+                jump_x = observed_beacon_x - vision_nav_obs.pending_anchor_x_cm;
+                jump_y = observed_beacon_y - vision_nav_obs.pending_anchor_y_cm;
+                if(vision_nav_absf(jump_x) <= VISION_NAV_ANCHOR_STABLE_CM &&
+                   vision_nav_absf(jump_y) <= VISION_NAV_ANCHOR_STABLE_CM)
+                {
+                    vision_nav_obs.pending_anchor_x_cm =
+                        0.7f * vision_nav_obs.pending_anchor_x_cm + 0.3f * observed_beacon_x;
+                    vision_nav_obs.pending_anchor_y_cm =
+                        0.7f * vision_nav_obs.pending_anchor_y_cm + 0.3f * observed_beacon_y;
+                    if(vision_nav_obs.stable_frames < 255u) vision_nav_obs.stable_frames++;
+                    if(vision_nav_obs.stable_frames >= VISION_NAV_MIN_STABLE_FRAMES)
+                    {
+                        vision_nav_begin_target(vision_nav_obs.pending_anchor_x_cm,
+                                                vision_nav_obs.pending_anchor_y_cm);
+                    }
+                }
+                else
+                {
+                    vision_nav_obs.pending_anchor_x_cm = observed_beacon_x;
+                    vision_nav_obs.pending_anchor_y_cm = observed_beacon_y;
+                    vision_nav_obs.stable_frames = 1u;
+                }
+            }
+        }
+        else if(vision_nav_obs.anchor_valid)
+        {
+            jump_x = observed_beacon_x - vision_nav_obs.anchor_x_cm;
+            jump_y = observed_beacon_y - vision_nav_obs.anchor_y_cm;
+
+            if(vision_nav_absf(jump_x) > VISION_NAV_TARGET_SWITCH_CM ||
+               vision_nav_absf(jump_y) > VISION_NAV_TARGET_SWITCH_CM)
+            {
+                if(vision_nav_obs.car_arrived)
+                {
+                    vision_nav_obs.target_done = 1u;
+                    vision_nav_obs.state = VISION_NAV_DONE;
+                }
+                else
+                {
+                    vision_nav_start_search();
+                }
+            }
+            else
+            {
+                float drone_x = vision_nav_obs.anchor_x_cm - rel_x_e;
+                float drone_y = vision_nav_obs.anchor_y_cm - rel_y_e;
+                float residual_x = drone_x - ekf_lite_state.x;
+                float residual_y = drone_y - ekf_lite_state.y;
+
+                vision_nav_obs.lost_since_us = 0u;
+                vision_nav_obs.drone_x_cm = drone_x;
+                vision_nav_obs.drone_y_cm = drone_y;
+                vision_nav_obs.residual_x_cm = residual_x;
+                vision_nav_obs.residual_y_cm = residual_y;
+                vision_nav_obs.confidence = 1.0f;
+                vision_nav_obs.valid = (vision_nav_absf(residual_x) <= VISION_NAV_MAX_RESIDUAL_CM &&
+                                        vision_nav_absf(residual_y) <= VISION_NAV_MAX_RESIDUAL_CM) ? 1u : 0u;
+
+                if(vision_nav_obs.valid &&
+                   now_us - vision_nav_obs.last_fusion_us >= VISION_NAV_FUSION_INTERVAL_US)
+                {
+                    vision_nav_obs.last_fusion_us = now_us;
+                    vision_nav_apply_ekf(residual_x, residual_y, 1.0f);
+                }
+            }
+        }
     }
-
-    confidence = (float)vision_nav_obs.stable_frames /
-                 (float)VISION_NAV_MIN_STABLE_FRAMES;
-    confidence = vision_nav_clampf(confidence, 0.0f, 1.0f);
-
-    vision_nav_obs.drone_x_cm = drone_x;
-    vision_nav_obs.drone_y_cm = drone_y;
-    vision_nav_obs.residual_x_cm = residual_x;
-    vision_nav_obs.residual_y_cm = residual_y;
-    vision_nav_obs.confidence = confidence;
-    vision_nav_obs.valid = (gate_ok &&
-        vision_nav_obs.stable_frames >= VISION_NAV_MIN_STABLE_FRAMES) ? 1u : 0u;
-
-    if(vision_nav_obs.valid)
+    else if(vision_nav_obs.anchor_valid)
     {
-        vision_nav_update_ekf_xy(drone_x, drone_y, confidence);
-        vision_nav_obs.used_for_ekf = (VISION_NAV_ENABLE_EKF_UPDATE != 0) ? 1u : 0u;
+        if(vision_nav_obs.lost_since_us == 0u) vision_nav_obs.lost_since_us = now_us;
+
+        if(vision_nav_obs.car_arrived &&
+           now_us - vision_nav_obs.lost_since_us >= VISION_NAV_BEACON_OFF_CONFIRM_US)
+        {
+            vision_nav_obs.target_done = 1u;
+            vision_nav_obs.state = VISION_NAV_DONE;
+            vision_nav_obs.anchor_valid = 0u;
+        }
+        else if(!vision_nav_obs.car_arrived &&
+                now_us - vision_nav_obs.lost_since_us >= VISION_NAV_TARGET_LOST_RESET_US)
+        {
+            vision_nav_start_search();
+        }
     }
 
     {
         static uint32_t last_print_us = 0u;
-        if(system_time_us() - last_print_us > VISION_NAV_PRINT_INTERVAL_US)
+        if(now_us - last_print_us >= VISION_NAV_PRINT_INTERVAL_US)
         {
-            last_print_us = system_time_us();
-            printf("VNAV: id=%u obs(%.1f,%.1f) ekf(%.1f,%.1f) res(%.1f,%.1f) valid=%u stable=%u\n",
-                   vision_nav_obs.beacon_id,
-                   vision_nav_obs.drone_x_cm,
-                   vision_nav_obs.drone_y_cm,
-                   ekf_lite_state.x,
-                   ekf_lite_state.y,
-                   vision_nav_obs.residual_x_cm,
-                   vision_nav_obs.residual_y_cm,
-                   vision_nav_obs.valid,
-                   vision_nav_obs.stable_frames);
+            last_print_us = now_us;
+            uint32_t lost_us = (vision_nav_obs.lost_since_us == 0u) ? 0u :
+                               now_us - vision_nav_obs.lost_since_us;
+            /*printf("VNAV:t=%lu,state=%u,seq=%u,geom=%u,anchor=%u,car_arr=%u,done=%u,"
+                   "h=%.1f,rpy=(%.2f,%.2f,%.2f),px_raw=(%d,%d),px_corr=(%.1f,%.1f),"
+                   "rel_body=(%.1f,%.1f),rel_earth=(%.1f,%.1f),anchor_xy=(%.1f,%.1f),"
+                   "beacon_obs=(%.1f,%.1f),drone_obs=(%.1f,%.1f),ekf=(%.1f,%.1f),"
+                   "res=(%.1f,%.1f),valid=%u,used=%u,corr=(%.2f,%.2f),lost_us=%lu,"
+                   "search=(%u,%u,%u),goal=(%.1f,%.1f),"
+                   "fb=(%u,%u,%u,0x%02X,%d,%d)\r\n",
+                   (unsigned long)now_us,
+                   vision_nav_obs.state, vision_nav_obs.target_seq,
+                   vision_nav_obs.geometry_ok, vision_nav_obs.anchor_valid,
+                   vision_nav_obs.car_arrived,
+                   vision_nav_obs.target_done,
+                   vehicle_state.current_height,
+                   vehicle_state.current_roll,
+                   vehicle_state.current_pitch,
+                   imu_data.yaw,
+                   beacon.centerX, beacon.centerY,
+                   beacon_corr_x, beacon_corr_y,
+                   beacon_drone_x_cm, beacon_drone_y_cm,
+                   vision_nav_obs.rel_earth_x_cm,
+                   vision_nav_obs.rel_earth_y_cm,
+                   vision_nav_obs.anchor_x_cm,
+                   vision_nav_obs.anchor_y_cm,
+                   vision_nav_obs.observed_beacon_x_cm,
+                   vision_nav_obs.observed_beacon_y_cm,
+                   vision_nav_obs.drone_x_cm, vision_nav_obs.drone_y_cm,
+                   ekf_lite_state.x, ekf_lite_state.y,
+                   vision_nav_obs.residual_x_cm, vision_nav_obs.residual_y_cm,
+                   vision_nav_obs.valid, vision_nav_obs.used_for_ekf,
+                   vision_nav_obs.ekf_correction_x_cm,
+                   vision_nav_obs.ekf_correction_y_cm,
+                   (unsigned long)lost_us,
+                   vision_nav_obs.search_move_active,
+                   vision_nav_obs.search_lost_frames,
+                   vision_nav_obs.search_found_frames,
+                   vehicle_setpoint.target_pos_x,
+                   vehicle_setpoint.target_pos_y,
+                   mcar_comm_feedback.valid,
+                   vision_nav_obs.feedback_fresh,
+                   mcar_comm_feedback.target_seq,
+                   mcar_comm_feedback.status,
+                   mcar_comm_feedback.err_forward_px,
+                   mcar_comm_feedback.err_right_px);*/
         }
     }
 }

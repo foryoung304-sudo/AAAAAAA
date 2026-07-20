@@ -1429,6 +1429,30 @@
     <group>
         <name>code</name>
         <file>
+            <name>$PROJ_DIR$\..\..\code\fisheye_lut.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\fisheye_lut.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\image.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\image.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\vision_shared.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\vision_shared.h</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\vision_worker.c</name>
+        </file>
+        <file>
+            <name>$PROJ_DIR$\..\..\code\vision_worker.h</name>
+        </file>
+        <file>
             <name>$PROJ_DIR$\..\..\code\本文件夹作用.txt</name>
         </file>
     </group>
