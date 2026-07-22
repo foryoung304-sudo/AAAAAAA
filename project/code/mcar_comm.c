@@ -1,6 +1,7 @@
 #include "mcar_comm.h"
 
 mcar_comm_feedback_t mcar_comm_feedback = {0};
+mcar_comm_diag_t mcar_comm_diag = {0};
 
 static uint8 mcar_comm_rx_frame[MCAR_COMM_FEEDBACK_SIZE];
 static uint8 mcar_comm_rx_count;
@@ -25,6 +26,7 @@ static uint8 mcar_comm_crc8(const uint8 *data, uint8 length)
 void mcar_comm_init(void)
 {
     memset(&mcar_comm_feedback, 0, sizeof(mcar_comm_feedback));
+    memset(&mcar_comm_diag, 0, sizeof(mcar_comm_diag));
     mcar_comm_rx_count = 0u;
     uart_init(MCAR_COMM_UART, MCAR_COMM_BAUDRATE,
               MCAR_COMM_TX_PIN, MCAR_COMM_RX_PIN);
@@ -48,6 +50,8 @@ void mcar_comm_poll(void)
            mcar_comm_rx_frame[9] == MCAR_COMM_FRAME_TAIL &&
            mcar_comm_rx_frame[8] == mcar_comm_crc8(mcar_comm_rx_frame, 8u))
         {
+            uint32 now_us = system_time_us();
+
             mcar_comm_feedback.target_seq = mcar_comm_rx_frame[2];
             mcar_comm_feedback.status = mcar_comm_rx_frame[3];
             mcar_comm_feedback.err_forward_px = (int16)(
@@ -56,8 +60,12 @@ void mcar_comm_poll(void)
             mcar_comm_feedback.err_right_px = (int16)(
                 (uint16)mcar_comm_rx_frame[6] |
                 ((uint16)mcar_comm_rx_frame[7] << 8u));
-            mcar_comm_feedback.timestamp_us = system_time_us();
+            mcar_comm_feedback.timestamp_us = now_us;
             mcar_comm_feedback.valid = 1u;
+            mcar_comm_diag.rx_period_us = (mcar_comm_diag.last_rx_us == 0u) ?
+                0u : now_us - mcar_comm_diag.last_rx_us;
+            mcar_comm_diag.last_rx_us = now_us;
+            mcar_comm_diag.rx_count++;
         }
 
         mcar_comm_rx_count = 0u;
@@ -76,6 +84,7 @@ void mcar_comm_send_target(uint8 target_seq,
                            int16 mcar_yaw_earth_cdeg, uint8 flags)
 {
     uint8 frame[MCAR_COMM_FRAME_SIZE];
+    uint32 now_us = system_time_us();
 
     frame[0] = MCAR_COMM_FRAME_HEAD;
     frame[1] = MCAR_COMM_CMD_TARGET;
@@ -90,6 +99,10 @@ void mcar_comm_send_target(uint8 target_seq,
     frame[10] = mcar_comm_crc8(frame, 10u);
     frame[11] = MCAR_COMM_FRAME_TAIL;
 
+    mcar_comm_diag.tx_period_us = (mcar_comm_diag.last_tx_us == 0u) ?
+        0u : now_us - mcar_comm_diag.last_tx_us;
+    mcar_comm_diag.last_tx_us = now_us;
+    mcar_comm_diag.tx_count++;
     uart_write_buffer(MCAR_COMM_UART, frame, MCAR_COMM_FRAME_SIZE);
 }
 

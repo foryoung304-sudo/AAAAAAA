@@ -40,9 +40,9 @@
 
 #define ALT_THROTTLE_SLEW                50.0f
 
-#define ALT_HOVER_TRIM_VOLT_GAIN         3.0f
-#define ALT_HOVER_TRIM_MAX               4.5f
-#define ALT_HOVER_TRIM_SLEW              0.5f
+#define ALT_HOVER_TRIM_VOLT_GAIN         4.0f
+#define ALT_HOVER_TRIM_MAX               6.0f
+#define ALT_HOVER_TRIM_SLEW              1.0f
 #define ALT_NEAR_GROUND_BRAKE_HEIGHT_CM  13.0f
 #define ALT_NEAR_GROUND_BRAKE_GAIN       0.0f
 #define ALT_NEAR_GROUND_BRAKE_LIMIT      1.20f

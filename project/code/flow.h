@@ -37,8 +37,8 @@
 #define FLOW_SENSOR_PMW3901 0
 #define FLOW_SENSOR_TYPE FLOW_SENSOR_LC302
 
-#define LC302_FLOW_SCALE_X_BASE 1.34f
-#define LC302_FLOW_SCALE_Y_BASE 1.60f
+#define LC302_FLOW_SCALE_X_BASE 1.072f
+#define LC302_FLOW_SCALE_Y_BASE 1.28f
 #define LC302_LOW_LIGHT_SCALE_GAIN 15.0f
 #if LC302_LOW_LIGHT_MODE
 #define LC302_FLOW_SCALE_X                                                     \

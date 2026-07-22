@@ -17,6 +17,9 @@ typedef struct {
 typedef struct {
     uint32_t frame_id;
     uint32_t timestamp_us;
+    uint32_t camera_dt_us;
+    uint32_t process_us;
+    uint32_t display_us;
     uint8_t blob_count;
     uint8_t beacon_valid;
     uint8_t ycar_valid;

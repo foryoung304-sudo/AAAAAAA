@@ -1,4 +1,5 @@
 #include "zf_common_headfile.h"
+#include "vision_nav.h"
 
 
 // ============================================================================
@@ -112,12 +113,26 @@ static uint8_t loc_hold_entry_ready(void)
     float vz_limit = (loc_auto_low_height_mode() != 0u) ?
                      LOC_AUTO_LOW_ENABLE_VZ_MAX_CM_S : LOC_ENABLE_VZ_MAX_CM_S;
 
-    return ((loc_damping_ready() != 0u) &&
-            (vehicle_state.current_height >= enable_height) &&
-            (fabsf(vehicle_state.current_vel_z) <= vz_limit) &&
-            (fabsf(vehicle_state.current_roll) <= LOC_ENABLE_ATT_MAX_DEG) &&
-            (fabsf(vehicle_state.current_pitch) <= LOC_ENABLE_ATT_MAX_DEG) &&
-            (horiz_spd <= LOC_ENABLE_HORIZ_VEL_MAX_CM_S));
+    if((loc_damping_ready() == 0u) ||
+       (vehicle_state.current_height < enable_height) ||
+       (fabsf(vehicle_state.current_vel_z) > vz_limit) ||
+       (fabsf(vehicle_state.current_roll) > LOC_ENABLE_ATT_MAX_DEG) ||
+       (fabsf(vehicle_state.current_pitch) > LOC_ENABLE_ATT_MAX_DEG))
+    {
+        return 0u;
+    }
+
+    /*
+     * Automatic takeoff/landing already owns a fixed horizontal target.
+     * Requiring normal low-speed entry can prevent capture after an early
+     * cable or ground-effect disturbance. Let the velocity loop brake it.
+     */
+    if(loc_auto_low_height_mode() != 0u)
+    {
+        return 1u;
+    }
+
+    return (horiz_spd <= LOC_ENABLE_HORIZ_VEL_MAX_CM_S) ? 1u : 0u;
 }
 
 static uint8_t loc_hold_should_release(void)
@@ -300,6 +315,21 @@ static void loc_update_position_profile(float goal_x,
         (LOC_PROFILE_BLEND_END_CM - LOC_PROFILE_BLEND_START_CM));
     profile_speed_limit = LOC_PROFILE_NEAR_SPEED_CM_S +
         (LOC_PROFILE_FAR_SPEED_CM_S - LOC_PROFILE_NEAR_SPEED_CM_S) * speed_blend;
+    if((vision_nav_obs.search_move_active != 0u) &&
+       (profile_speed_limit > VISION_NAV_SEARCH_SPEED_LIMIT_CM_S))
+    {
+        profile_speed_limit = VISION_NAV_SEARCH_SPEED_LIMIT_CM_S;
+    }
+    if((vision_nav_obs.approach_active != 0u) &&
+       (profile_speed_limit > VISION_NAV_APPROACH_SPEED_LIMIT_CM_S))
+    {
+        profile_speed_limit = VISION_NAV_APPROACH_SPEED_LIMIT_CM_S;
+    }
+    if((vision_nav_obs.car_follow_active != 0u) &&
+       (profile_speed_limit > VISION_NAV_CAR_FOLLOW_SPEED_LIMIT_CM_S))
+    {
+        profile_speed_limit = VISION_NAV_CAR_FOLLOW_SPEED_LIMIT_CM_S;
+    }
     desired_speed = LIMIT(sqrtf(2.0f * LOC_TRAJ_ACCEL_CM_S2 * distance),
                           0.0f,
                           profile_speed_limit);
@@ -1093,7 +1123,8 @@ void loc_ctrl_update(float dT_s)
             if(loc_hold_entry_ready() != 0u)
             {
                 loc_rt.loc_hold_stable_time_s += dT_s;
-                if(loc_rt.loc_hold_stable_time_s >= 0.3f)
+                if((loc_auto_low_height_mode() != 0u) ||
+                   (loc_rt.loc_hold_stable_time_s >= 0.3f))
                 {
                     /* Automatic takeoff/landing already owns a latched target. */
                     if(loc_auto_low_height_mode() == 0u)
@@ -1121,8 +1152,11 @@ void loc_ctrl_update(float dT_s)
             }
         }
 
+        float blend_time_s = (loc_auto_low_height_mode() != 0u) ?
+            LOC_AUTO_LOW_BLEND_TIME_S : LOC_BLEND_TIME_S;
+
         loc_rt.loc_ready_time_s += dT_s;
-        loc_rt.loc_weight += dT_s / LOC_BLEND_TIME_S;
+        loc_rt.loc_weight += dT_s / blend_time_s;
         loc_rt.loc_weight = LIMIT(loc_rt.loc_weight, 0.0f, 1.0f);
         loc_rt.brake_weight += dT_s / LOC_BRAKE_BLEND_TIME_S;
         loc_rt.brake_weight = LIMIT(loc_rt.brake_weight, 0.0f, 1.0f);

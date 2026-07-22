@@ -56,7 +56,7 @@ extern BeaconInfo beacon;
 #define CAR_DIR_EMA_ALPHA 0.7f
 #define MAX_IR_BLOBS 32
 #define YCAR_DETECTION_ENABLE 1
-#define YCAR_GUIDANCE_ENABLE  0
+#define YCAR_GUIDANCE_ENABLE  1
 
 #define BEACON_CAL_DEBUG_ENABLE       1
 #define BEACON_CAL_DEBUG_INTERVAL_US  500000u
@@ -122,6 +122,7 @@ extern float ycar_head_body_y;
 extern float debug_ycar_angle;
 extern uint8_t debug_ycar_lost;
 extern VisionDetectionSnapshot_t vision_detection_snapshot;
+extern uint32_t vision_last_frame_rx_us;
 extern uint32_t vision_profile_camera_dt_us;
 extern uint32_t vision_profile_process_us;
 extern uint32_t vision_profile_remap_us;

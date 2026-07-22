@@ -165,3 +165,4 @@ void motor_mixing_output(void)
     small_driver_set_duty(motor_out.m1, motor_out.m2, motor_out.m3, motor_out.m4);
     
 }
+

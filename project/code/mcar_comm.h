@@ -8,6 +8,9 @@
 #define MCAR_COMM_TX_PIN               (UART5_TX_P02_1)
 #define MCAR_COMM_RX_PIN               (UART5_RX_P02_0)
 
+/* Bench test only: repeatedly command the car forward from each vision frame. */
+#define MCAR_COMM_FIXED_TARGET_TEST_ENABLE (1u)
+
 #define MCAR_COMM_FRAME_HEAD           (0xA5u)
 #define MCAR_COMM_FRAME_TAIL           (0x5Au)
 #define MCAR_COMM_CMD_TARGET           (0x01u)
@@ -36,6 +39,16 @@ typedef struct
     uint32 timestamp_us;
 } mcar_comm_feedback_t;
 
+typedef struct
+{
+    uint32 tx_count;
+    uint32 rx_count;
+    uint32 tx_period_us;
+    uint32 rx_period_us;
+    uint32 last_tx_us;
+    uint32 last_rx_us;
+} mcar_comm_diag_t;
+
 /*
  * A5 CMD SEQ FLAGS FWD_L FWD_H RIGHT_L RIGHT_H YAW_L YAW_H CRC8 5A
  * Position errors are signed image pixels in the M-car frame. Yaw is the
@@ -55,5 +68,6 @@ void mcar_comm_send_stop(uint8 target_seq);
 uint8 mcar_comm_feedback_is_fresh(uint8 target_seq, uint32 max_age_us);
 
 extern mcar_comm_feedback_t mcar_comm_feedback;
+extern mcar_comm_diag_t mcar_comm_diag;
 
 #endif

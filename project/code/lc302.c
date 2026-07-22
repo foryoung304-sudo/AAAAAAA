@@ -10,6 +10,24 @@ static uint8_t lc302_xor_calc = 0;
 static uint8_t lc302_xor_recv = 0;
 static uint32_t lc302_frame_start_rx_us = 0u;
 
+#define LC302_PACKET_HISTORY_COUNT 16u
+
+typedef struct
+{
+    uint32_t time_us;
+    uint32_t frame_count;
+    int16_t raw_x;
+    int16_t raw_y;
+    uint16_t integration_us;
+    uint16_t height;
+    uint8_t quality;
+    uint8_t version;
+} lc302_packet_history_t;
+
+static lc302_packet_history_t lc302_packet_history[LC302_PACKET_HISTORY_COUNT];
+static uint8_t lc302_packet_history_wr = 0u;
+static uint8_t lc302_packet_history_count = 0u;
+
 static int16_t lc302_i16_le(uint8_t low, uint8_t high)
 {
     return (int16_t)((uint16_t)low | ((uint16_t)high << 8));
@@ -50,6 +68,26 @@ static void lc302_decode_payload(void)
      * first byte, while the final-byte timestamp remains useful for health. */
     lc302_data.last_frame_start_rx_us = lc302_frame_start_rx_us;
     lc302_data.last_frame_rx_us = system_time_us();
+
+    {
+        lc302_packet_history_t *sample =
+            &lc302_packet_history[lc302_packet_history_wr];
+        sample->time_us = lc302_data.last_frame_rx_us;
+        sample->frame_count = lc302_data.frame_count;
+        sample->raw_x = lc302_data.raw_x;
+        sample->raw_y = lc302_data.raw_y;
+        sample->integration_us = lc302_data.integration_timespan;
+        sample->height = lc302_data.height;
+        sample->quality = lc302_data.quality;
+        sample->version = lc302_data.version;
+        lc302_packet_history_wr =
+            (uint8_t)((lc302_packet_history_wr + 1u) %
+                      LC302_PACKET_HISTORY_COUNT);
+        if(lc302_packet_history_count < LC302_PACKET_HISTORY_COUNT)
+        {
+            lc302_packet_history_count++;
+        }
+    }
 }
 
 static void lc302_parse_byte(uint8_t ch)
@@ -120,9 +158,45 @@ void lc302_init(void)
     lc302_xor_calc = 0;
     lc302_xor_recv = 0;
     lc302_frame_start_rx_us = 0u;
+    memset(lc302_packet_history, 0, sizeof(lc302_packet_history));
+    lc302_packet_history_wr = 0u;
+    lc302_packet_history_count = 0u;
 
     uart_init(LC302_UART, LC302_BAUDRATE, LC302_RX_PIN, LC302_TX_PIN);
     uart_rx_interrupt(LC302_UART, 1);
+}
+
+void lc302_debug_print_packet_history(void)
+{
+    lc302_packet_history_t snapshot[LC302_PACKET_HISTORY_COUNT];
+    uint8_t count;
+    uint8_t wr;
+    uint8_t i;
+    uint32_t primask = interrupt_global_disable();
+
+    count = lc302_packet_history_count;
+    wr = lc302_packet_history_wr;
+    memcpy(snapshot, lc302_packet_history, sizeof(snapshot));
+    interrupt_global_enable(primask);
+
+    printf("[LC302_Q_HEADER],time_us,frame,raw_x,raw_y,dt_us,height,quality,version\r\n");
+    for(i = 0u; i < count; i++)
+    {
+        uint8_t start = (count == LC302_PACKET_HISTORY_COUNT) ? wr : 0u;
+        uint8_t index =
+            (uint8_t)((start + i) % LC302_PACKET_HISTORY_COUNT);
+        const lc302_packet_history_t *sample = &snapshot[index];
+
+        printf("[LC302_Q],%lu,%lu,%d,%d,%u,%u,%u,%u\r\n",
+               (unsigned long)sample->time_us,
+               (unsigned long)sample->frame_count,
+               sample->raw_x,
+               sample->raw_y,
+               sample->integration_us,
+               sample->height,
+               sample->quality,
+               sample->version);
+    }
 }
 
 void lc302_uart_callback(void)

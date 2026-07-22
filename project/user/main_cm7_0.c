@@ -115,19 +115,17 @@ int main(void)
             if(height_cost_us > main_height_max_us) main_height_max_us = height_cost_us;
         }
 
-       /* if(pid_menu_request)
-        {
-            pid_menu_request = 0;
-            pid_menu_task();
-        }
+        /* Keep pid_menu_init() for Flash PID loading, but do not refresh the
+         * IPS114 during the airborne mission test. */
+        pid_menu_request = 0;
+
+        vision_consumer_update();
 
         if(debug_print_request)
         {
             debug_print_request = 0;
             debug_print_states();
-        }*/
-        
-      vision_consumer_update();
+        }
       //memcpy(base_image, mt9v03x_image, MT9V03X_IMAGE_SIZE); // 将采集到的图像数据复制到 base_image 中
 
 

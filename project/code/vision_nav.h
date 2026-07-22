@@ -3,7 +3,7 @@
 
 #include "zf_common_headfile.h"
 
-#define VISION_NAV_ENABLE_EKF_UPDATE          1
+#define VISION_NAV_ENABLE_EKF_UPDATE          0
 #define VISION_NAV_MIN_HEIGHT_CM              30.0f
 #define VISION_NAV_MAX_HEIGHT_CM              180.0f
 #define VISION_NAV_MAX_ATT_DEG                10.0f
@@ -21,9 +21,20 @@
 #define VISION_NAV_FAST_SEARCH_ENABLE                1
 #define VISION_NAV_SEARCH_CENTER_X_CM            100.0f
 #define VISION_NAV_SEARCH_CENTER_Y_CM            150.0f
+#define VISION_NAV_SEARCH_SPEED_LIMIT_CM_S         30.0f
 #define VISION_NAV_SEARCH_MIN_HEIGHT_CM           65.0f
 #define VISION_NAV_SEARCH_LOST_FRAMES               3u
 #define VISION_NAV_SEARCH_REACQUIRE_FRAMES          2u
+#define VISION_NAV_APPROACH_SPEED_LIMIT_CM_S        30.0f
+#define VISION_NAV_APPROACH_MIN_HEIGHT_CM           65.0f
+#define VISION_NAV_APPROACH_ACQUIRE_FRAMES            3u
+#define VISION_NAV_APPROACH_LOST_FRAMES               3u
+#define VISION_NAV_APPROACH_STOP_RADIUS_CM          15.0f
+#define VISION_NAV_APPROACH_TARGET_STEP_CM           8.0f
+#define VISION_NAV_CAR_FOLLOW_START_CM               70.0f
+#define VISION_NAV_CAR_FOLLOW_STOP_CM                50.0f
+#define VISION_NAV_CAR_FOLLOW_TARGET_STEP_CM          8.0f
+#define VISION_NAV_CAR_FOLLOW_SPEED_LIMIT_CM_S       22.0f
 
 typedef enum
 {
@@ -48,6 +59,12 @@ typedef struct
     uint8_t search_move_active;
     uint8_t search_lost_frames;
     uint8_t search_found_frames;
+    uint8_t approach_active;
+    uint8_t approach_arrived;
+    uint8_t approach_lost_frames;
+    uint8_t approach_found_frames;
+    uint8_t car_follow_active;
+    float car_distance_cm;
     float drone_x_cm;
     float drone_y_cm;
     float rel_earth_x_cm;

@@ -117,17 +117,18 @@ void pit0_ch0_isr()                     // ��ʱ��ͨ�� 0 ����
         lora3a22_state_flag = 0;           // ǿ�����㣺���� remote_ctrl.c �е�ʧ������Ͱ�ȫ�����߼�
     }
 
-    //motor_mixing_output();
+    motor_mixing_output();
     //small_driver_set_duty(duty,duty,duty,duty);
     
     // =================  20ms ���� =================
     if(loop_cnt % 10 == 0) 
     {
+           
+
         uint32_t current_20ms_time = system_time_us();
         static uint32_t main_20ms_cnt = 0;
         main_20ms_cnt++;
-        /* Main loop services only the post-disarm dump.  The coherent RAM
-         * snapshot is taken below after all 20 ms controllers have run. */
+        /* Main loop rate-limits this request to 5 Hz mission telemetry. */
         debug_print_request = 1;
         if(main_20ms_cnt % 5 == 0)
         {

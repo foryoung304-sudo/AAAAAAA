@@ -53,6 +53,7 @@ extern lc302_data_t lc302_data;
 void lc302_init(void);
 void lc302_uart_callback(void);
 void lc302_update(void);
+void lc302_debug_print_packet_history(void);
 void lc302_get_motion(float *dx, float *dy, uint8_t *valid, uint8_t *quality,
                       uint16_t *count, uint32_t *integration_us,
                       uint32_t *frame_count,

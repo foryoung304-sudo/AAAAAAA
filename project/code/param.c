@@ -1,4 +1,7 @@
 #include "zf_common_headfile.h"
+#include "beacon.h"
+#include "mcar_comm.h"
+#include "vision_nav.h"
 
 
 static float alt_target_vel_z_ramped = 0.0f;
@@ -7,6 +10,9 @@ static float alt_target_height_ramped=0.0f;
 #define LOC_TEST_TARGET_HEIGHT_CM  140.0f
 #define LOC_TEST_TARGET_POS_X_CM     0.0f
 #define LOC_TEST_TARGET_POS_Y_CM     0.0f
+#define MISSION_CRUISE_HEIGHT_ERR_CM  5.0f
+#define MISSION_CRUISE_VZ_MAX_CM_S    5.0f
+#define MISSION_CRUISE_STABLE_TIME_S  1.0f
 
 uint8_t locked_flag = 0;
 uint8_t auto_landing_request = 0;
@@ -145,7 +151,6 @@ static uint8_t preflight_flow_is_healthy(void)
 {
     return ((lc302_data.byte_count > 0u) &&
             (lc302_data.frame_count > 0u) &&
-            (lc302_data.quality >= LC302_QUALITY_MIN) &&
             (vehicle_state.flow_valid != 0u)) ? 1u : 0u;
 }
 
@@ -317,12 +322,13 @@ uint8_t preflight_check(void)
     {
         errors |= PREFLIGHT_ERR_FLOW_NO_FRAME;
     }
-    else if(lc302_data.quality < LC302_QUALITY_MIN)
+    else if(vehicle_state.flow_valid == 0u)
     {
-        errors |= PREFLIGHT_ERR_FLOW_QUALITY;
+        errors |= (lc302_data.quality < LC302_QUALITY_MIN) ?
+            PREFLIGHT_ERR_FLOW_QUALITY :
+            PREFLIGHT_ERR_FLOW_NOT_READY;
     }
-    else if((vehicle_state.flow_valid == 0u) ||
-            (preflight_flow_ready_time_s < PREFLIGHT_FLOW_READY_TIME_S))
+    else if(preflight_flow_ready_time_s < PREFLIGHT_FLOW_READY_TIME_S)
     {
         errors |= PREFLIGHT_ERR_FLOW_NOT_READY;
     }
@@ -344,13 +350,16 @@ void param_init(void)
 
 }
 
-#define DEBUG_STATE_LOG_SAMPLE_COUNT      600u
-#define DEBUG_STATE_LOG_SAMPLE_RATE_HZ    50u
-#define DEBUG_STATE_LOG_START_HEIGHT_CM   45.0f
-#define DEBUG_HISTORY_SAMPLE_COUNT        1000u
+#define DEBUG_STATE_LOG_SAMPLE_COUNT      240u
+#define DEBUG_STATE_LOG_SAMPLE_RATE_HZ     10u
+#define DEBUG_STATE_LOG_START_HEIGHT_CM    0.0f
+#define DEBUG_HISTORY_SAMPLE_COUNT           1u
+#define MISSION_DEBUG_LOG_ENABLE             1u
+#define FLIGHT_RAM_TRACE_ENABLE               1u
 
 typedef struct {
     uint32_t seq;
+    uint32_t capture_generation;
     uint32_t time_us;
     float dt_ms;
     uint8_t armed;
@@ -421,6 +430,32 @@ typedef struct {
     int16_t m2;
     int16_t m3;
     int16_t m4;
+    uint8_t flight_mode;
+    uint8_t beacon_found;
+    uint8_t ycar_valid;
+    uint8_t search_active;
+    uint8_t search_lost_frames;
+    uint8_t search_found_frames;
+    uint8_t nav_state;
+    uint8_t target_seq;
+    uint32_t car_tx_period_us;
+    uint32_t car_rx_period_us;
+    uint32_t car_tx_count;
+    uint32_t car_rx_count;
+    uint8_t tof_raw_valid;
+    uint8_t tof_stale;
+    uint8_t tof_stream;
+    uint8_t failsafe_flags;
+    uint32_t vision_frame_id;
+    uint32_t vision_rx_age_ms;
+    uint32_t vision_cam_dt_us;
+    uint32_t vision_process_us;
+    uint32_t vision_display_us;
+    uint32_t vision_att_age_ms;
+    uint32_t tof_recovery_count;
+    float tof_raw_cm;
+    float pos_x_cm;
+    float pos_y_cm;
 } debug_state_sample_t;
 
 /* A compact 50 Hz flight timeline.  It is intentionally independent of the
@@ -464,6 +499,7 @@ static uint8_t debug_state_recording = 0u;
 static uint8_t debug_state_ready = 0u;
 static uint16_t debug_state_wr_idx = 0u;
 static uint8_t debug_state_buffer_full = 0u;
+static uint32_t debug_state_capture_generation = 0u;
 static uint16_t debug_history_count = 0u;
 static uint16_t debug_history_dump_index = 0u;
 static uint16_t debug_history_wr_idx = 0u;
@@ -484,9 +520,14 @@ static int16_t debug_pack_i16(float value, float scale)
  */
 void debug_capture_states_20ms(void)
 {
+#if !FLIGHT_RAM_TRACE_ENABLE
+    return;
+#else
     uint32_t now_us = system_time_us();
     uint8_t armed = vehicle_state.armed;
+    debug_state_sample_t *sample;
     static uint32_t last_time_us = 0;
+    static uint8_t sample_divider = 0u;
 
     if((armed != 0u) &&
        (alt_phase != ALT_PHASE_LANDING) &&
@@ -499,12 +540,18 @@ void debug_capture_states_20ms(void)
         debug_state_dump_index = 0u;
         debug_state_wr_idx = 0u;
         debug_state_buffer_full = 0u;
+        debug_state_capture_generation++;
+        if(debug_state_capture_generation == 0u)
+        {
+            debug_state_capture_generation = 1u;
+        }
         debug_history_count = 0u;
         debug_history_dump_index = 0u;
         debug_history_wr_idx = 0u;
         debug_history_buffer_full = 0u;
         debug_history_header_printed = 0u;
         debug_state_recording = 1u;
+        sample_divider = 0u;
         last_time_us = now_us;
     }
 
@@ -520,9 +567,19 @@ void debug_capture_states_20ms(void)
 
     if(debug_state_recording != 0u)
     {
-        debug_state_sample_t *sample = &debug_state_buf[debug_state_wr_idx];
+        sample_divider++;
+        if(sample_divider <
+           (DEBUG_STATE_LOG_SAMPLE_RATE_HZ >= 50u ?
+            1u : (uint8_t)(50u / DEBUG_STATE_LOG_SAMPLE_RATE_HZ)))
+        {
+            return;
+        }
+        sample_divider = 0u;
+
+        sample = &debug_state_buf[debug_state_wr_idx];
 
         sample->seq = debug_state_wr_idx;
+        sample->capture_generation = debug_state_capture_generation;
         sample->time_us = now_us;
         sample->dt_ms = (last_time_us == 0) ? 0.0f : (float)(now_us - last_time_us) / 1000.0f;
         last_time_us = now_us;
@@ -616,7 +673,45 @@ void debug_capture_states_20ms(void)
         sample->m2 = motor_out.m2;
         sample->m3 = motor_out.m3;
         sample->m4 = motor_out.m4;
+        sample->flight_mode = (uint8_t)vehicle_state.flight_mode;
+        sample->beacon_found =
+            (beacon.status == BEACON_FOUND) ? 1u : 0u;
+        sample->ycar_valid = ycar_info.valid;
+#if BEACON_APPROACH_TEST_ENABLE
+        sample->search_active = vision_nav_obs.approach_active;
+        sample->search_lost_frames = vision_nav_obs.approach_lost_frames;
+        sample->search_found_frames = vision_nav_obs.approach_found_frames;
+#else
+        sample->search_active = vision_nav_obs.search_move_active;
+        sample->search_lost_frames = vision_nav_obs.search_lost_frames;
+        sample->search_found_frames = vision_nav_obs.search_found_frames;
+#endif
+        sample->nav_state = (uint8_t)vision_nav_obs.state;
+        sample->target_seq = vision_nav_obs.target_seq;
+        sample->car_tx_period_us = mcar_comm_diag.tx_period_us;
+        sample->car_rx_period_us = mcar_comm_diag.rx_period_us;
+        sample->car_tx_count = mcar_comm_diag.tx_count;
+        sample->car_rx_count = mcar_comm_diag.rx_count;
+        sample->tof_raw_valid = tof_health.raw_valid;
+        sample->tof_stale = tof_health.stale;
+        sample->tof_stream = tof_health.streamcount;
+        sample->failsafe_flags = flight_sensor_failsafe_flags;
+        sample->vision_frame_id = vision_detection_snapshot.frame_id;
+        sample->vision_rx_age_ms = (vision_last_frame_rx_us == 0u) ?
+            0xFFFFFFFFu : (now_us - vision_last_frame_rx_us) / 1000u;
+        sample->vision_cam_dt_us = vision_detection_snapshot.camera_dt_us;
+        sample->vision_process_us = vision_detection_snapshot.process_us;
+        sample->vision_display_us = vision_detection_snapshot.display_us;
+        sample->vision_att_age_ms =
+            (vision_detection_snapshot.attitude_timestamp_us == 0u) ?
+            0xFFFFFFFFu :
+            (now_us - vision_detection_snapshot.attitude_timestamp_us) / 1000u;
+        sample->tof_recovery_count = tof_health.recovery_count;
+        sample->tof_raw_cm = tof_health.raw_dist_cm;
+        sample->pos_x_cm = vehicle_state.current_pos_x;
+        sample->pos_y_cm = vehicle_state.current_pos_y;
 
+#if !MISSION_DEBUG_LOG_ENABLE
         {
             debug_history_sample_t *history = &debug_history_buf[debug_history_wr_idx];
             uint8_t flags = 0u;
@@ -664,6 +759,7 @@ void debug_capture_states_20ms(void)
             debug_history_count = debug_history_buffer_full ?
                                   DEBUG_HISTORY_SAMPLE_COUNT : debug_history_wr_idx;
         }
+#endif
 
         debug_state_wr_idx++;
         if(debug_state_wr_idx >= DEBUG_STATE_LOG_SAMPLE_COUNT)
@@ -678,6 +774,7 @@ void debug_capture_states_20ms(void)
             debug_state_count = debug_state_wr_idx;
         }
     }
+#endif
 }
 
 static void debug_print_safety_snapshots(void)
@@ -735,6 +832,11 @@ static void debug_print_safety_snapshots(void)
                (flight_failsafe_snapshot.reason_flags & PREFLIGHT_ERR_IMU) ? 1u : 0u,
                (flight_failsafe_snapshot.reason_flags & PREFLIGHT_ERR_TOF) ? 1u : 0u,
                (flight_failsafe_snapshot.reason_flags & PREFLIGHT_ERR_FLOW_NOT_READY) ? 1u : 0u);
+        if((flight_failsafe_snapshot.reason_flags &
+            PREFLIGHT_ERR_FLOW_NOT_READY) != 0u)
+        {
+            lc302_debug_print_packet_history();
+        }
         flight_failsafe_snapshot.pending = 0u;
     }
 }
@@ -745,6 +847,222 @@ static void debug_print_safety_snapshots(void)
  */
 void debug_print_states(void)
 {
+    /*
+     * Safety snapshots and the tiny LC302 packet history do not depend on the
+     * optional flight RAM trace.  Always service them after disarm, even when
+     * debug_state_ready can never be set because the large trace is disabled.
+     */
+    if(vehicle_state.armed == 0u)
+    {
+        debug_print_safety_snapshots();
+    }
+
+#if MISSION_DEBUG_LOG_ENABLE
+    uint8_t lines = 0u;
+
+    if((vehicle_state.armed != 0u) || (debug_state_ready == 0u))
+    {
+        return;
+    }
+
+    if(debug_state_dump_index == 0u)
+    {
+        printf("MISSION_LOG_HEADER,time_us,armed,mode,alt_phase,height_cm,batt_v,"
+               "roll_deg,pitch_deg,target_roll_deg,target_pitch_deg,yaw_deg,"
+               "flow,loc_ready,loc_hold,"
+               "pos_x_cm,pos_y_cm,goal_x_cm,goal_y_cm,vel_x_cm_s,vel_y_cm_s,"
+               "beacon,ycar,frame_id,rx_age_ms,cam_dt_us,vision_process_us,"
+               "display_us,att_age_ms,search_active,lost_frames,found_frames,"
+               "nav_state,target_seq,car_tx_dt_us,car_rx_dt_us,"
+               "car_tx_count,car_rx_count,failsafe,tof_raw_cm,tof_raw_valid,"
+               "tof_stale,tof_stream,tof_recover,throttle,m1,m2,m3,m4\r\n");
+    }
+
+    while((debug_state_dump_index < debug_state_count) && (lines < 10u))
+    {
+        uint16_t start_idx =
+            debug_state_buffer_full ? debug_state_wr_idx : 0u;
+        uint16_t real_idx =
+            (start_idx + debug_state_dump_index) %
+            DEBUG_STATE_LOG_SAMPLE_COUNT;
+        const debug_state_sample_t *sample = &debug_state_buf[real_idx];
+
+        if(sample->capture_generation != debug_state_capture_generation)
+        {
+            debug_state_dump_index++;
+            continue;
+        }
+
+        printf("MISSION_LOG,%lu,%u,%u,%u,%.1f,%.2f,"
+               "%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,"
+               "%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,"
+               "%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,"
+               "%u,%u,%lu,%lu,%lu,%lu,%u,%.1f,%u,%u,%u,%lu,"
+               "%.2f,%d,%d,%d,%d\r\n",
+               (unsigned long)sample->time_us,
+               (unsigned int)sample->armed,
+               (unsigned int)sample->flight_mode,
+               (unsigned int)sample->phase,
+               sample->height_cm,
+               sample->voltage,
+               sample->roll_cur,
+               sample->pitch_cur,
+               sample->roll_tgt,
+               sample->pitch_tgt,
+               sample->yaw_deg,
+               (unsigned int)sample->flow_valid,
+               (unsigned int)sample->loc_ready,
+               (unsigned int)sample->loc_hold,
+               sample->pos_x_cm,
+               sample->pos_y_cm,
+               sample->goal_pos_x_e,
+               sample->goal_pos_y_e,
+               sample->vel_x_e,
+               sample->vel_y_e,
+               (unsigned int)sample->beacon_found,
+               (unsigned int)sample->ycar_valid,
+               (unsigned long)sample->vision_frame_id,
+               (unsigned long)sample->vision_rx_age_ms,
+               (unsigned long)sample->vision_cam_dt_us,
+               (unsigned long)sample->vision_process_us,
+               (unsigned long)sample->vision_display_us,
+               (unsigned long)sample->vision_att_age_ms,
+               (unsigned int)sample->search_active,
+               (unsigned int)sample->search_lost_frames,
+               (unsigned int)sample->search_found_frames,
+               (unsigned int)sample->nav_state,
+               (unsigned int)sample->target_seq,
+               (unsigned long)sample->car_tx_period_us,
+               (unsigned long)sample->car_rx_period_us,
+               (unsigned long)sample->car_tx_count,
+               (unsigned long)sample->car_rx_count,
+               (unsigned int)sample->failsafe_flags,
+               sample->tof_raw_cm,
+               (unsigned int)sample->tof_raw_valid,
+               (unsigned int)sample->tof_stale,
+               (unsigned int)sample->tof_stream,
+               (unsigned long)sample->tof_recovery_count,
+               sample->throttle,
+               sample->m1,
+               sample->m2,
+               sample->m3,
+               sample->m4);
+
+        debug_state_dump_index++;
+        lines++;
+    }
+
+    if(debug_state_dump_index >= debug_state_count)
+    {
+        debug_print_safety_snapshots();
+        printf("MISSION_LOG_END\r\n");
+        debug_state_ready = 0u;
+        debug_state_count = 0u;
+        debug_state_dump_index = 0u;
+        debug_history_count = 0u;
+        debug_history_dump_index = 0u;
+        debug_history_header_printed = 0u;
+    }
+    return;
+#else
+#if 0 /* Live MISSION CSV blocks the main-loop ToF update; keep flight silent. */
+    static uint8_t mission_print_divider = 0u;
+    static uint8_t mission_header_printed = 0u;
+    uint32_t now_us;
+    uint32_t frame_age_ms;
+    uint32_t attitude_age_ms;
+
+    mission_print_divider++;
+    if(mission_print_divider < 10u)
+    {
+        return;
+    }
+    mission_print_divider = 0u;
+
+    now_us = system_time_us();
+    frame_age_ms = (vision_last_frame_rx_us == 0u) ?
+        0xFFFFFFFFu :
+        (now_us - vision_last_frame_rx_us) / 1000u;
+    attitude_age_ms = (vision_detection_snapshot.attitude_timestamp_us == 0u) ?
+        0xFFFFFFFFu :
+        (now_us - vision_detection_snapshot.attitude_timestamp_us) / 1000u;
+
+    if(mission_header_printed == 0u)
+    {
+        printf("MISSION_HEADER,time_us,armed,rc_ok,arm_sw,preflight_err,"
+               "flow_quality,flow_ready_ms,"
+               "failsafe,tof_raw_cm,tof_raw_valid,tof_stale,tof_stream,tof_recover,"
+               "mode,alt_phase,height_cm,batt_v,"
+               "roll_deg,pitch_deg,yaw_deg,flow,loc_ready,loc_hold,"
+               "pos_x_cm,pos_y_cm,goal_x_cm,goal_y_cm,vel_x_cm_s,vel_y_cm_s,"
+               "beacon,ycar,frame_id,rx_age_ms,cam_dt_us,vision_process_us,"
+               "display_us,att_age_ms,search_active,lost_frames,"
+               "found_frames,nav_state,target_seq,car_fb,car_status,"
+               "car_err_fwd_px,car_err_right_px\r\n");
+        mission_header_printed = 1u;
+    }
+
+    printf("MISSION,%lu,%u,%u,%u,%u,%u,%lu,%u,%.1f,%u,%u,%u,%lu,"
+           "%u,%u,%.1f,%.2f,"
+           "%.2f,%.2f,%.2f,%u,%u,%u,"
+           "%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,"
+           "%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%d,%d\r\n",
+           (unsigned long)now_us,
+           (unsigned int)vehicle_state.armed,
+           (unsigned int)lora3a22_state_flag,
+           (unsigned int)lora3a22_uart_transfer.switch_key[1],
+           (unsigned int)preflight_error_flags,
+           (unsigned int)lc302_data.quality,
+           (unsigned long)(preflight_flow_ready_time_s * 1000.0f),
+           (unsigned int)flight_sensor_failsafe_flags,
+           tof_health.raw_dist_cm,
+           (unsigned int)tof_health.raw_valid,
+           (unsigned int)tof_health.stale,
+           (unsigned int)tof_health.streamcount,
+           (unsigned long)tof_health.recovery_count,
+           (unsigned int)vehicle_state.flight_mode,
+           (unsigned int)alt_phase,
+           vehicle_state.current_height,
+           vehicle_state.battery_voltage_filtered,
+           vehicle_state.current_roll,
+           vehicle_state.current_pitch,
+           vehicle_state.current_yaw,
+           (unsigned int)vehicle_state.flow_valid,
+           (unsigned int)loc_1l_ct.loc_ready,
+           (unsigned int)loc_1l_ct.loc_hold_ready,
+           vehicle_state.current_pos_x,
+           vehicle_state.current_pos_y,
+           vehicle_setpoint.target_pos_x,
+           vehicle_setpoint.target_pos_y,
+           loc_1l_ct.fb_vel_x,
+           loc_1l_ct.fb_vel_y,
+           (unsigned int)((beacon.status == BEACON_FOUND) ? 1u : 0u),
+           (unsigned int)ycar_info.valid,
+           (unsigned long)vision_detection_snapshot.frame_id,
+           (unsigned long)frame_age_ms,
+           (unsigned long)vision_detection_snapshot.camera_dt_us,
+           (unsigned long)vision_detection_snapshot.process_us,
+           (unsigned long)vision_detection_snapshot.display_us,
+           (unsigned long)attitude_age_ms,
+#if BEACON_APPROACH_TEST_ENABLE
+           (unsigned int)vision_nav_obs.approach_active,
+           (unsigned int)vision_nav_obs.approach_lost_frames,
+           (unsigned int)vision_nav_obs.approach_found_frames,
+#else
+           (unsigned int)vision_nav_obs.search_move_active,
+           (unsigned int)vision_nav_obs.search_lost_frames,
+           (unsigned int)vision_nav_obs.search_found_frames,
+#endif
+           (unsigned int)vision_nav_obs.state,
+           (unsigned int)vision_nav_obs.target_seq,
+           (unsigned int)mcar_comm_feedback.valid,
+           (unsigned int)mcar_comm_feedback.status,
+           (int)mcar_comm_feedback.err_forward_px,
+           (int)mcar_comm_feedback.err_right_px);
+    return;
+#endif
+
+#if 1 /* Capture in RAM while armed, then dump in bounded chunks after lock. */
 #if 0 /* Superseded malformed CSV emitter; retained temporarily for diff context. */
     if((debug_state_ready == 0u) || (vehicle_state.armed != 0u))
     {
@@ -951,6 +1269,8 @@ void debug_print_states(void)
         debug_history_dump_index = 0u;
         debug_history_header_printed = 0u;
     }
+#endif
+#endif
 }
 
 /**
@@ -960,6 +1280,8 @@ void debug_print_states(void)
  */
 void param_update(float dT_s)
 {
+    static float mission_cruise_stable_time_s = 0.0f;
+    static uint8_t mission_cruise_ready = 0u;
     if(dT_s <= 0.0f || dT_s > 0.1f)
     {
         dT_s = REMOTE_SAMPLE_TIME;
@@ -975,6 +1297,8 @@ void param_update(float dT_s)
     // 安全保护：未解锁时，所有期望值贴住当前状态，避免解锁瞬间跳变。
     if (vehicle_state.armed == 0)
     {
+        mission_cruise_stable_time_s = 0.0f;
+        mission_cruise_ready = 0u;
         auto_landing_active = 0;
         alt_target_vel_z_ramped = 0.0f;
         alt_target_height_ramped = vehicle_state.current_height;
@@ -1090,6 +1414,51 @@ void param_update(float dT_s)
     {
         vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
         vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+        vehicle_setpoint.target_vel_x = 0.0f;
+        vehicle_setpoint.target_vel_y = 0.0f;
+    }
+#elif VISION_MISSION_MODE_ENABLE || BEACON_APPROACH_TEST_ENABLE
+    /*
+     * Competition mission test:
+     * - climb to the validated vision height;
+     * - hold the takeoff position until horizontal control is ready;
+     * - then leave horizontal waypoint ownership to vision_nav.
+     *
+     * vision_nav owns the horizontal waypoint after LOC becomes ready.  The
+     * selected compile-time vision mode decides whether that means field
+     * search or the isolated beacon-approach test.
+     */
+    if((vehicle_state.current_height >=
+        (LOC_TEST_TARGET_HEIGHT_CM - MISSION_CRUISE_HEIGHT_ERR_CM)) &&
+       (fabsf(vehicle_state.current_vel_z) <= MISSION_CRUISE_VZ_MAX_CM_S) &&
+       (loc_1l_ct.loc_hold_ready != 0u))
+    {
+        mission_cruise_stable_time_s += dT_s;
+        if(mission_cruise_stable_time_s >= MISSION_CRUISE_STABLE_TIME_S)
+        {
+            mission_cruise_ready = 1u;
+        }
+    }
+    else if(mission_cruise_ready == 0u)
+    {
+        mission_cruise_stable_time_s = 0.0f;
+    }
+
+    vehicle_state.flight_mode = (mission_cruise_ready != 0u) ?
+        FLY_AUTOFLY : FLY_AUTOTAKEOFF;
+    vehicle_setpoint.target_height = LOC_TEST_TARGET_HEIGHT_CM;
+    vehicle_setpoint.target_yaw_rate = 0.0f;
+
+    if((vehicle_state.flow_valid == 0u) ||
+       (vehicle_state.current_height < LOC_ENABLE_HEIGHT_CM) ||
+       (loc_1l_ct.loc_hold_ready == 0u))
+    {
+        /*
+         * FLY_AUTOTAKEOFF captures its horizontal target on mode entry, and
+         * FLY_AUTOLANDING captures it when landing is requested.  Preserve
+         * that point while low-altitude damping/hold gains blend in; following
+         * the drifting EKF position here cancels the very error LOC needs.
+         */
         vehicle_setpoint.target_vel_x = 0.0f;
         vehicle_setpoint.target_vel_y = 0.0f;
     }
