@@ -16,7 +16,7 @@
 #define HEIGHT_ZUPT_INNOV_CM            0.2f
 #define HEIGHT_ZUPT_DELTA_CM            0.3f
 #define HEIGHT_ZUPT_VEL_DECAY           0.98f
-#define HEIGHT_NEAR_GROUND_RECOVER_CM   1.0f
+#define HEIGHT_NEAR_GROUND_RECOVER_CM   11.0f
 #define HEIGHT_ACC_Z_EKF_GAIN           0.20f
 #define HEIGHT_ACC_Z_LIMIT_CM_S2        300.0f
 #define HEIGHT_ACC_Z_LPF_ALPHA          0.18f
@@ -33,10 +33,12 @@
 #define HEIGHT_TOF_VEL_R_CM2_S2         200.0f
 #define TOF_STALE_TIMEOUT_US            120000u
 #define TOF_STUCK_TIMEOUT_US            500000u
-#define TOF_PREFLIGHT_MAX_HEIGHT_CM     20.0f
+#define TOF_PREFLIGHT_MAX_HEIGHT_CM     30.0f
 #define TOF_PREFLIGHT_VALID_FRAMES      5u
 #define TOF_RECOVERY_RETRY_US           2000000u
 #define TOF_GROUND_FAULT_CONFIRM_US     500000u
+/* Downward ToF lens is 10 cm below the aircraft center of gravity. */
+#define TOF_TO_CG_VERTICAL_OFFSET_CM    10.0f
 
 extern float tof_dist_cm;
 extern float acc_z_cm_s2;

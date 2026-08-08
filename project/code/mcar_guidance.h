@@ -11,6 +11,13 @@ typedef struct
     uint8 valid;
 } mcar_guidance_t;
 
+typedef struct
+{
+    float mcar_yaw_body_deg;
+    float mcar_yaw_earth_deg;
+    uint8 valid;
+} mcar_guidance_diag_t;
+
 mcar_guidance_t mcar_guidance_calculate(float beacon_body_x,
                                         float beacon_body_y,
                                         float mcar_body_x,
@@ -18,5 +25,7 @@ mcar_guidance_t mcar_guidance_calculate(float beacon_body_x,
                                         float mcar_head_body_x,
                                         float mcar_head_body_y,
                                         float drone_yaw_earth_deg);
+
+extern mcar_guidance_diag_t mcar_guidance_diag;
 
 #endif

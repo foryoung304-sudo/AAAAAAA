@@ -108,14 +108,14 @@ uint8 uart_isr_mask(uart_index_enum uart_n)
         
             for(int i = 0; i < rx_num; i ++)
             {
-                uart_data_buffer[uart_n][uart_data_buffer_count[uart_n] ++]  = (uint8)Cy_SCB_ReadRxFifo(scb_module_temp);
-                
-                if(uart_data_buffer_count[uart_n] > 15)
+                if(uart_data_buffer_count[uart_n] >= (uint8)sizeof(uart_data_buffer[uart_n]))
                 {
                     Cy_SCB_ClearRxFifo(scb_module_temp);
-                    
                     break;
                 }
+
+                uart_data_buffer[uart_n][uart_data_buffer_count[uart_n] ++] =
+                    (uint8)Cy_SCB_ReadRxFifo(scb_module_temp);
             }
             
             uart_data_refresh[uart_n] = 1;

@@ -32,9 +32,12 @@ imu_data_t imu_data = {
 static volatile uint8 imu_log_running = 0;
 static volatile uint8 imu_log_full = 0;
 static volatile uint16 imu_log_index = 0;
+static uint16 imu_log_dump_index = 0;
 static imu_log_sample_t imu_log_buf[IMU_LOG_SAMPLE_COUNT];
 static float imu_log_gyro_unfiltered[3] = {0.0f, 0.0f, 0.0f};
 static float imu_log_acc_unfiltered[3] = {0.0f, 0.0f, 1.0f};
+static float imu_mount_yaw_cos = 1.0f;
+static float imu_mount_yaw_sin = 0.0f;
 
 float imu_debug_ex = 0.0f;
 float imu_debug_ey = 0.0f;
@@ -59,6 +62,8 @@ extern uint32_t duty;
 
 static void imu_map_gyro_to_body(float raw_gyro_x, float raw_gyro_y, float raw_gyro_z,
                                  float *gyro_x, float *gyro_y, float *gyro_z);
+static void imu_rotate_mount_xy_to_body(float sensor_x, float sensor_y,
+                                        float *body_x, float *body_y);
 
 static int16 imu_log_float_to_i16(float value)
 {
@@ -74,6 +79,7 @@ static int16 imu_log_float_to_i16(float value)
 void imu_log_start(void)
 {
     imu_log_index = 0;
+    imu_log_dump_index = 0;
     imu_log_full = 0;
     imu_log_running = 1;
 }
@@ -124,23 +130,31 @@ void imu_log_dump_task(void)
     }
 
     count = imu_log_index;
-    printf("IMU_LOG_BEGIN fs=500 count=%u duty=%lu gyro_scale=100 acc_scale=10000\r\n",
-           count, (uint32)duty);
-
-    for(uint16 i = 0; i < count; i++) {
-        printf("%u,%d,%d,%d,%d,%d,%d,%u\r\n",
-               i,
-               imu_log_buf[i].gx,
-               imu_log_buf[i].gy,
-               imu_log_buf[i].gz,
-               imu_log_buf[i].ax,
-               imu_log_buf[i].ay,
-               imu_log_buf[i].az,
-               imu_log_buf[i].bad);
+    if(imu_log_dump_index == 0u) {
+        printf("IMU_LOG_BEGIN fs=500 count=%u duty=%lu gyro_scale=100 acc_scale=10000\r\n",
+               count, (uint32)duty);
     }
 
-    printf("IMU_LOG_END\r\n");
-    imu_log_full = 0;
+    // Export one sample per main-loop pass so UART output cannot monopolize it.
+    if(imu_log_dump_index < count) {
+        const imu_log_sample_t *sample = &imu_log_buf[imu_log_dump_index];
+        printf("%u,%d,%d,%d,%d,%d,%d,%u\r\n",
+               imu_log_dump_index,
+               sample->gx,
+               sample->gy,
+               sample->gz,
+               sample->ax,
+               sample->ay,
+               sample->az,
+               sample->bad);
+        imu_log_dump_index++;
+    }
+
+    if(imu_log_dump_index >= count) {
+        printf("IMU_LOG_END\r\n");
+        imu_log_full = 0;
+        imu_log_dump_index = 0;
+    }
 }
 
 
@@ -691,9 +705,25 @@ float imu_acc_1g_raw(void)
 static void imu_map_gyro_to_body(float raw_gyro_x, float raw_gyro_y, float raw_gyro_z,
                                  float *gyro_x, float *gyro_y, float *gyro_z)
 {
-    *gyro_x = -raw_gyro_x;
-    *gyro_y =  raw_gyro_y;
+    float nominal_x = -raw_gyro_x;
+    float nominal_y =  raw_gyro_y;
+
+    imu_rotate_mount_xy_to_body(nominal_x, nominal_y, gyro_x, gyro_y);
     *gyro_z = -raw_gyro_z;
+}
+
+static void imu_rotate_mount_xy_to_body(float sensor_x, float sensor_y,
+                                        float *body_x, float *body_y)
+{
+    /*
+     * Body X points forward and body Y points right. If the IMU +X axis is
+     * physically clockwise from the nose, rotate the sign-mapped sensor
+     * vector clockwise by the same positive angle to recover body axes.
+     */
+    *body_x = imu_mount_yaw_cos * sensor_x -
+              imu_mount_yaw_sin * sensor_y;
+    *body_y = imu_mount_yaw_sin * sensor_x +
+              imu_mount_yaw_cos * sensor_y;
 }
 
 uint8 imu_chip_id_is_ok(void)
@@ -741,7 +771,7 @@ void imu_calc(void)
     float raw_acc_y=imu_acc_transition(imu_data.acc_raw[1]);
     float raw_acc_z=imu_acc_transition(imu_data.acc_raw[2]);
 
-    // Raw frame -> body frame. Gyro and acc must use the same axis map.
+    // Raw frame -> nominal frame -> mount-yaw-corrected aircraft body frame.
     float gyro_x;
     float gyro_y;
     float gyro_z;
@@ -750,14 +780,16 @@ void imu_calc(void)
     gyro_y -= imu_data.gyro_offset_actual[1];
     gyro_z -= imu_data.gyro_offset_actual[2];
 
-    float body_acc_x=-raw_acc_x;
-    float body_acc_y= raw_acc_y;
-    float body_acc_z=-raw_acc_z;
+    float nominal_acc_x = raw_acc_x;
+    float nominal_acc_y = -raw_acc_y;
+    float acc_x;
+    float acc_y;
+    float acc_z = raw_acc_z;
 
-
-    float acc_x=-body_acc_x;
-    float acc_y=-body_acc_y;
-    float acc_z=-body_acc_z;
+    imu_rotate_mount_xy_to_body(nominal_acc_x,
+                                nominal_acc_y,
+                                &acc_x,
+                                &acc_y);
     float gyro_raw_frame[3] = {gyro_x, gyro_y, gyro_z};
     float acc_raw_frame[3] = {acc_x, acc_y, acc_z};
 
@@ -864,11 +896,22 @@ void imu_calc(void)
                             imu_data.roll,
                             imu_data.pitch,
                             imu_data.yaw);
+    {
+        /* Keep the last complete main-loop snapshot if the seqlock happens
+         * to be changing during this 2 ms interrupt. */
+        static VisionFieldMapDisplay_t field_map_display;
+        (void)field_map_get_display(&field_map_display);
     vision_attitude_shared_publish(current_time_us,
                                    imu_data.roll,
                                    imu_data.pitch,
                                    imu_data.yaw,
-                                   vehicle_state.current_height);
+                                   vehicle_state.current_height,
+                                   mcar_comm_diag.last_tx_err_forward_px,
+                                   mcar_comm_diag.last_tx_err_right_px,
+                                   (uint8_t)vehicle_state.flight_mode,
+                                   (uint8_t)vehicle_state.armed,
+                                   &field_map_display);
+    }
 
 }
 
@@ -876,6 +919,12 @@ void imu_calc(void)
 void imu_data_init(void)
 {
     attitude_history_reset();
+    {
+        float mount_yaw_rad =
+            IMU_MOUNT_YAW_DEG * (3.1415926f / 180.0f);
+        imu_mount_yaw_cos = cosf(mount_yaw_rad);
+        imu_mount_yaw_sin = sinf(mount_yaw_rad);
+    }
     // 初始化滤波器
     init_filters();
     

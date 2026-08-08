@@ -52,19 +52,38 @@ extern uint32_t duty;
 extern volatile uint8 imu660rc_chip_id_debug;
 extern uint32_t loop_cnt;
 extern volatile uint8_t height_update_request;
-extern volatile uint8_t pid_menu_request;
+extern volatile uint8_t field_map_request;
 extern volatile uint8_t debug_print_request;
-void pid_menu_init(void);
-void pid_menu_task(void);
+void field_map_init(void);
+void field_map_task(void);
+void diag_pidwrite_check(uint8_t stage);
+void diag_pidwrite_rearm(void);
 
 int main(void)
 {
     clock_init(SYSTEM_CLOCK_250M); 	// ʱ�����ü�ϵͳ��ʼ��<��ر���>
     debug_init();                       // ���Դ�����Ϣ��ʼ��
+    {
+        uint32_t reset_reason = Cy_SysReset_GetResetReason();
+        uint32_t mcwdt_mask = CY_SYSRESET_MCWDT0 |
+                              CY_SYSRESET_MCWDT1 |
+                              CY_SYSRESET_MCWDT2 |
+                              CY_SYSRESET_MCWDT3;
+
+        printf("RESETCAUSE,raw=0x%08lX,wdt=%u,act_fault=%u,soft=%u,mcwdt=%u,xres=%u,porvddd=%u\r\n",
+               (unsigned long)reset_reason,
+               (reset_reason & CY_SYSRESET_WDT) ? 1u : 0u,
+               (reset_reason & CY_SYSRESET_ACT_FAULT) ? 1u : 0u,
+               (reset_reason & CY_SYSRESET_SOFT) ? 1u : 0u,
+               (reset_reason & mcwdt_mask) ? 1u : 0u,
+               (reset_reason & CY_SYSRESET_PXRES) ? 1u : 0u,
+               (reset_reason & CY_SYSRESET_PORVDDD) ? 1u : 0u);
+        Cy_SysReset_ClearAllResetReasons();
+    }
     // �˴���д�û����� ���������ʼ�������
  
 
-   lora3a22_init();
+  lora3a22_init();
    //imu660rc_init(IMU660RC_QUARTERNION_DISABLE);
    icm42688_init();
    //imu660rc_init(IMU660RC_QUARTERNION_120HZ);
@@ -83,17 +102,29 @@ int main(void)
    param_init();
    att_ctrl_init();
    alt_ctrl_init();
+ //  diag_pidwrite_rearm();
+ //  diag_pidwrite_check(30u);
    loc_ctrl_init();
+ //  diag_pidwrite_check(31u);
+ //  field_map_init();
    vision_nav_init();
-   pid_menu_init();
-   small_driver_uart_init();
-   mcar_comm_init();
-    //wireless_uart_init();
+ //  diag_pidwrite_check(32u);
+   //pid_menu_init();
+ //  diag_pidwrite_check(33u);
+ //  ips114_init();
+  // diag_pidwrite_check(34u);
 
+   small_driver_uart_init();
+  // diag_pidwrite_check(35u);
+   mcar_comm_init();
+   //diag_pidwrite_check(36u);
+    //wireless_uart_init();
+//   imu_log_start();
     pit_ms_init(PIT_CH0, 2); 
+    ////diag_pidwrite_check(37u);
     pit_enable(PIT_CH0);
-   //imu_log_start();
-    
+
+
 
 
 
@@ -105,26 +136,32 @@ int main(void)
         //imu_log_dump_task();
         //height_log_dump_task();
         //loc_log_dump_task();
-
-        if(height_update_request)
+       // printf("main loop, dt20ms=%.3fms, dt2ms=%.3fms, isr_cost=%luus, duty=%lu\r\n", real_dt_20ms*1000.0f, real_dt_2ms*1000.0f, isr_time_cost, duty);
+      if(height_update_request)
         {
             uint32_t height_start_us = system_time_us();
             height_update_request = 0;
             update_current_height(0.02f);
+           // diag_pidwrite_check(20u);
             uint32_t height_cost_us = system_time_us() - height_start_us;
             if(height_cost_us > main_height_max_us) main_height_max_us = height_cost_us;
         }
 
-        /* Keep pid_menu_init() for Flash PID loading, but do not refresh the
-         * IPS114 during the airborne mission test. */
-        pid_menu_request = 0;
+/*       if(field_map_request)
+        {
+            field_map_request = 0;
+            field_map_task();
+            diag_pidwrite_check(21u);
+        }
+*/
+       vision_consumer_update();
+      // diag_pidwrite_check(22u);
 
-        vision_consumer_update();
-
-        if(debug_print_request)
+       if(debug_print_request)
         {
             debug_print_request = 0;
             debug_print_states();
+            //diag_pidwrite_check(23u);
         }
       //memcpy(base_image, mt9v03x_image, MT9V03X_IMAGE_SIZE); // 将采集到的图像数据复制到 base_image 中
 
@@ -134,8 +171,8 @@ int main(void)
         //printf("%d",chip_id);
         //lc302_update();
         //lc302_debug_print();
-        //flow_debug_print();
-         //printf("channel_data:%.3f,%.3f,%.3f\r\n", imu_data.pitch, imu_data.roll, imu_data.yaw);
+       //flow_debug_print();
+        // printf("channel_data:%.3f,%.3f,%.3f\r\n", imu_data.pitch, imu_data.roll, imu_data.yaw);
       /* printf("rpy %.3f %.3f %.3f | e %.5f %.5f %.5f | i %.5f %.5f %.5f | kp %.3f ki %.3f w %.2f gn %.4f\r\n",
             imu_data.roll, imu_data.pitch, imu_data.yaw,
             imu_debug_ex, imu_debug_ey, imu_debug_ez,
@@ -152,7 +189,8 @@ int main(void)
             ct_val.rol, ct_val.pit, ct_val.yaw,
             vehicle_setpoint.target_throttle,
             motor_out.m1, motor_out.m2, motor_out.m3, motor_out.m4);*/
-    
+       // printf("height: %.3f \r\n",
+           // vehicle_state.current_height);
 
         //debug_pit_diag_task(&main_height_max_us);
       

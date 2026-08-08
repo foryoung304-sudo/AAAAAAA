@@ -66,9 +66,78 @@ volatile uint32_t diag_alt2_max_us = 0;
 volatile uint32_t diag_alt1_max_us = 0;
 volatile uint8_t height_update_request = 0;
 volatile uint32_t height_update_drop_count = 0;
-volatile uint8_t pid_menu_request = 0;
+volatile uint8_t field_map_request = 0;
 volatile uint8_t debug_print_request = 0;
 volatile uint8_t diag_print_request = 0;
+
+/* ALT V corruption probe.  The ISR only freezes the first observed write;
+ * printing is deferred to the main loop so flight timing is unchanged. */
+volatile uint8_t diag_pidwrite_pending = 0u;
+volatile uint8_t diag_pidwrite_stage = 0u;
+volatile uint32_t diag_pidwrite_time_us = 0u;
+volatile uint32_t diag_pidwrite_before[3] = {0u, 0u, 0u};
+volatile uint32_t diag_pidwrite_after[3] = {0u, 0u, 0u};
+volatile uint8_t diag_pidwrite_rearm_request = 0u;
+
+void diag_pidwrite_rearm(void)
+{
+    diag_pidwrite_pending = 0u;
+    diag_pidwrite_rearm_request = 1u;
+}
+
+static void diag_pidwrite_read(uint32_t bits[3])
+{
+    memcpy(&bits[0], &alt_ctrl.vel_pid.kp, sizeof(uint32_t));
+    memcpy(&bits[1], &alt_ctrl.vel_pid.ki, sizeof(uint32_t));
+    memcpy(&bits[2], &alt_ctrl.vel_pid.kd, sizeof(uint32_t));
+}
+
+void diag_pidwrite_check(uint8_t stage)
+{
+    static uint8_t initialized = 0u;
+    static uint8_t captured = 0u;
+    static uint32_t previous[3] = {0u, 0u, 0u};
+    uint32_t current[3];
+
+    diag_pidwrite_read(current);
+    if(diag_pidwrite_rearm_request != 0u)
+    {
+        diag_pidwrite_rearm_request = 0u;
+        initialized = 1u;
+        captured = 0u;
+        previous[0] = current[0];
+        previous[1] = current[1];
+        previous[2] = current[2];
+        return;
+    }
+    if(initialized == 0u)
+    {
+        initialized = 1u;
+        previous[0] = current[0];
+        previous[1] = current[1];
+        previous[2] = current[2];
+        return;
+    }
+    if((captured == 0u) &&
+       ((current[0] != previous[0]) ||
+        (current[1] != previous[1]) ||
+        (current[2] != previous[2])))
+    {
+        diag_pidwrite_before[0] = previous[0];
+        diag_pidwrite_before[1] = previous[1];
+        diag_pidwrite_before[2] = previous[2];
+        diag_pidwrite_after[0] = current[0];
+        diag_pidwrite_after[1] = current[1];
+        diag_pidwrite_after[2] = current[2];
+        diag_pidwrite_stage = stage;
+        diag_pidwrite_time_us = system_time_us();
+        diag_pidwrite_pending = 1u;
+        captured = 1u;
+    }
+    previous[0] = current[0];
+    previous[1] = current[1];
+    previous[2] = current[2];
+}
 
 
 
@@ -83,6 +152,9 @@ void pit0_ch0_isr()                     // ��ʱ��ͨ�� 0 ����
 
     loop_cnt++;
     diag_pit_count++;
+    diag_pidwrite_check(15u); /* PIT entry, before M-car UART polling */
+    mcar_comm_poll();
+    diag_pidwrite_check(1u);  /* after M-car UART polling */
 
     // ================= 2ms ���� =================
     if(last_2ms_time != 0)
@@ -100,13 +172,15 @@ void pit0_ch0_isr()                     // ��ʱ��ͨ�� 0 ����
    
 
     imu_calc();
+    diag_pidwrite_check(2u);
     //imu_log_sample_isr();
 
 
-    flow_gyro_integrate(real_dt_2ms);
+   flow_gyro_integrate(real_dt_2ms);
     ekf_lite_predict_height(real_dt_2ms);
     ekf_lite_predict_xy(real_dt_2ms);
     att_1level_ctrl(real_dt_2ms);     
+    diag_pidwrite_check(3u);  /* flow + EKF predict + attitude rate */
      
 
     // ================= ң����ʧ�ر������ =================
@@ -118,6 +192,7 @@ void pit0_ch0_isr()                     // ��ʱ��ͨ�� 0 ����
     }
 
     motor_mixing_output();
+    //diag_pidwrite_check(4u);
     //small_driver_set_duty(duty,duty,duty,duty);
     
     // =================  20ms ���� =================
@@ -128,12 +203,9 @@ void pit0_ch0_isr()                     // ��ʱ��ͨ�� 0 ����
         uint32_t current_20ms_time = system_time_us();
         static uint32_t main_20ms_cnt = 0;
         main_20ms_cnt++;
-        /* Main loop rate-limits this request to 5 Hz mission telemetry. */
+        /* The key driver is initialized for this exact 20 ms scan period. */
         debug_print_request = 1;
-        if(main_20ms_cnt % 5 == 0)
-        {
-            pid_menu_request = 1;
-        }
+        field_map_request = 1;
         if(main_20ms_cnt >= 50)
         {
             main_20ms_cnt = 0;
@@ -152,6 +224,7 @@ void pit0_ch0_isr()                     // ��ʱ��ͨ�� 0 ����
 
        uint32_t seg_start = system_time_us();
        system_power_update(real_dt_20ms);
+       diag_pidwrite_check(5u);
        uint32_t seg_cost = system_time_us() - seg_start;
        if(seg_cost > diag_power_max_us) diag_power_max_us = seg_cost;
 
@@ -169,21 +242,25 @@ void pit0_ch0_isr()                     // ��ʱ��ͨ�� 0 ����
 
        seg_start = system_time_us();
        ekf_lite_update_height();
+       diag_pidwrite_check(6u);
        seg_cost = system_time_us() - seg_start;
        if(seg_cost > diag_ekf_h_max_us) diag_ekf_h_max_us = seg_cost;
 
        seg_start = system_time_us();
        update_position_from_flow(real_dt_20ms); 
+       diag_pidwrite_check(7u);
        seg_cost = system_time_us() - seg_start;
        if(seg_cost > diag_flow_max_us) diag_flow_max_us = seg_cost;
         
         seg_start = system_time_us();
         ekf_lite_update_xy(real_dt_20ms);
+        diag_pidwrite_check(8u);
         seg_cost = system_time_us() - seg_start;
         if(seg_cost > diag_ekf_xy_max_us) diag_ekf_xy_max_us = seg_cost;
 
         seg_start = system_time_us();
         param_update(real_dt_20ms);        // ����ģʽ����������ָ������ (50Hz)
+        diag_pidwrite_check(9u);
         seg_cost = system_time_us() - seg_start;
         if(seg_cost > diag_param_max_us) diag_param_max_us = seg_cost;
         
@@ -191,23 +268,28 @@ void pit0_ch0_isr()                     // ��ʱ��ͨ�� 0 ����
 
         seg_start = system_time_us();
         alt_2level_ctrl(real_dt_20ms);
+        diag_pidwrite_check(10u);
         seg_cost = system_time_us() - seg_start;
         if(seg_cost > diag_alt2_max_us) diag_alt2_max_us = seg_cost;
 
         loc_ctrl_update(real_dt_20ms);          
+        diag_pidwrite_check(11u);
 
         seg_start = system_time_us();
         att_2level_ctrl(real_dt_20ms);     
+        diag_pidwrite_check(12u);
         seg_cost = system_time_us() - seg_start;
         if(seg_cost > diag_att2_max_us) diag_att2_max_us = seg_cost;
 
         seg_start = system_time_us();
-        alt_1level_ctrl(real_dt_20ms); 
+       alt_1level_ctrl(real_dt_20ms);
+        diag_pidwrite_check(13u);
         seg_cost = system_time_us() - seg_start;
         if(seg_cost > diag_alt1_max_us) diag_alt1_max_us = seg_cost;
 
         // RAM only: no printf/UART activity while flying.
-        debug_capture_states_20ms();
+       debug_capture_states_20ms();
+       diag_pidwrite_check(14u);
        //height_log_update_50hz();
       //loc_log_update_50hz();
  
@@ -311,6 +393,7 @@ void pit0_ch21_isr()                    // ��ʱ��ͨ�� 21 ����
 // ����0Ĭ����Ϊ���Դ���
 void uart0_isr (void)
 {
+    diag_pidwrite_check(40u);
     if(uart_isr_mask(UART_0))            // ����0�����ж�
     {
         
@@ -325,10 +408,12 @@ void uart0_isr (void)
         
         
     }
+    diag_pidwrite_check(41u);
 }
 
 void uart1_isr (void)
 {
+    diag_pidwrite_check(42u);
     if(uart_isr_mask(UART_1))            // ����1�����ж�
     {
         
@@ -342,10 +427,12 @@ void uart1_isr (void)
         
         
     }
+    diag_pidwrite_check(43u);
 }
 
 void uart2_isr (void)
 {
+    diag_pidwrite_check(44u);
     if(uart_isr_mask(UART_2))            // ����2�����ж�
     {
         
@@ -358,10 +445,12 @@ void uart2_isr (void)
         
        
     }
+    diag_pidwrite_check(45u);
 }
 
 void uart3_isr (void)
 {
+    diag_pidwrite_check(46u);
     if(uart_isr_mask(UART_3))            // ����3�����ж�
     {
         
@@ -374,10 +463,12 @@ void uart3_isr (void)
         
         
     }
+    diag_pidwrite_check(47u);
 }
 
 void uart4_isr (void)
 {
+    diag_pidwrite_check(48u);
     if(uart_isr_mask(UART_4))            // ����4�����ж�
     {
         // ���UART4ֻ���˵����������������Ľ��ջص�����ֹ������
@@ -390,15 +481,14 @@ void uart4_isr (void)
         
         
     }
+    diag_pidwrite_check(49u);
 }
 
 void uart5_isr (void)
 {
+    diag_pidwrite_check(50u);
     if(uart_isr_mask(UART_5))            // ����5�����ж�
     {
-        
-        
-       
     }
     else                                // ����5�����ж�
     {
@@ -406,14 +496,16 @@ void uart5_isr (void)
         
         
     }
+    diag_pidwrite_check(51u);
 }
 
 void uart6_isr (void)
 {
+    diag_pidwrite_check(52u);
     if(uart_isr_mask(UART_6))            // ����6�����ж�
     {
-
-        
+        mcar_comm_diag.rx_irq_count++;
+        mcar_comm_poll();
        
     }
     else                                // ����6�����ж�
@@ -422,6 +514,7 @@ void uart6_isr (void)
         
         
     }
+    diag_pidwrite_check(53u);
 }
 // **************************** �����жϺ��� ****************************
 

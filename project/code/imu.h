@@ -25,6 +25,14 @@ typedef struct {
 
 #define IMU_TYPE       IMU_TYPE_ICM42688
 
+/*
+ * IMU board +X is mounted clockwise from the aircraft nose when viewed from
+ * above. Positive values rotate the already sign-mapped sensor XY axes back
+ * into the aircraft body frame. Gyro and accelerometer must use the same
+ * correction.
+ */
+#define IMU_MOUNT_YAW_DEG 0.0f
+
 // 定义IMU数据结构体
 typedef struct {
     // 陀螺仪偏移量

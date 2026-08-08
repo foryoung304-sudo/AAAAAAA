@@ -1,24 +1,22 @@
 #include "zf_common_headfile.h"
 #include "beacon.h"
 #include "mcar_comm.h"
+#include "mcar_guidance.h"
 #include "vision_nav.h"
 
 
 static float alt_target_vel_z_ramped = 0.0f;
 static float alt_target_height_ramped=0.0f;
 
-#define LOC_TEST_TARGET_HEIGHT_CM  140.0f
-#define LOC_TEST_TARGET_POS_X_CM     0.0f
-#define LOC_TEST_TARGET_POS_Y_CM     0.0f
-#define MISSION_CRUISE_HEIGHT_ERR_CM  5.0f
-#define MISSION_CRUISE_VZ_MAX_CM_S    5.0f
-#define MISSION_CRUISE_STABLE_TIME_S  1.0f
 
 uint8_t locked_flag = 0;
 uint8_t auto_landing_request = 0;
 uint8_t auto_landing_active = 0;
 volatile uint8_t preflight_error_flags = 0u;
 volatile uint8_t flight_sensor_failsafe_flags = 0u;
+uint8_t mission_height_recovery_active = 0u;
+uint8_t mission_task_requested = 0u;
+uint8_t mission_cruise_ready = 0u;
 param_t param = {0};
 flight_mode_t flight_mode = {0};
 vehicle_setpoint_t vehicle_setpoint={0}; 
@@ -116,6 +114,12 @@ typedef struct
     uint32_t lc302_frames;
     uint32_t lc302_errors;
     uint32_t lc302_last_rx_us;
+    uint32_t mcar_rx_bytes;
+    uint32_t mcar_hw_fifo_polls;
+    uint32_t mcar_hw_fifo_bytes;
+    uint32_t mcar_rx_good_frames;
+    uint32_t mcar_rx_bad_frames;
+    uint32_t mcar_rx_irqs;
     float flow_ready_time_s;
     float voltage;
     float height_cm;
@@ -180,6 +184,12 @@ static void preflight_capture_snapshot(uint8_t errors,
     preflight_snapshot.lc302_frames = lc302_data.frame_count;
     preflight_snapshot.lc302_errors = lc302_data.checksum_error_count;
     preflight_snapshot.lc302_last_rx_us = lc302_data.last_frame_rx_us;
+    preflight_snapshot.mcar_rx_bytes = mcar_comm_diag.rx_byte_count;
+    preflight_snapshot.mcar_hw_fifo_polls = mcar_comm_diag.hw_fifo_poll_count;
+    preflight_snapshot.mcar_hw_fifo_bytes = mcar_comm_diag.hw_fifo_byte_count;
+    preflight_snapshot.mcar_rx_good_frames = mcar_comm_diag.rx_count;
+    preflight_snapshot.mcar_rx_bad_frames = mcar_comm_diag.rx_bad_frame_count;
+    preflight_snapshot.mcar_rx_irqs = mcar_comm_diag.rx_irq_count;
     preflight_snapshot.flow_ready_time_s = preflight_flow_ready_time_s;
     preflight_snapshot.voltage = vehicle_state.battery_voltage_filtered;
     preflight_snapshot.height_cm = vehicle_state.current_height;
@@ -351,7 +361,7 @@ void param_init(void)
 }
 
 #define DEBUG_STATE_LOG_SAMPLE_COUNT      240u
-#define DEBUG_STATE_LOG_SAMPLE_RATE_HZ     10u
+#define DEBUG_STATE_LOG_SAMPLE_RATE_HZ     25u
 #define DEBUG_STATE_LOG_START_HEIGHT_CM    0.0f
 #define DEBUG_HISTORY_SAMPLE_COUNT           1u
 #define MISSION_DEBUG_LOG_ENABLE             1u
@@ -414,6 +424,18 @@ typedef struct {
     float rate_tgt_p;
     float rate_fb_p;
     float rate_out_p;
+    float rate_p_p;
+    float rate_i_p;
+    float rate_d_p;
+    float yaw_tgt;
+    float yaw_err;
+    float rate_tgt_y;
+    float rate_fb_y;
+    float rate_out_y;
+    float rate_p_y;
+    float rate_i_y;
+    float rate_d_y;
+    uint8_t takeoff_yaw_rate_hold;
     float imu_acc_body_y_m_s2;
     float flow_obs_vx_e;
     float flow_obs_vy_e;
@@ -423,9 +445,28 @@ typedef struct {
     uint8_t flow_obs_valid;
     uint8_t flow_ekf_used;
     uint8_t flow_gate_clipped;
+    uint8_t flow_quality;
+    uint16_t flow_accum_count;
+    uint32_t flow_integration_us;
+    float flow_raw_dx_cm;
+    float flow_raw_dy_cm;
+    float flow_vel_x_cm_s;
+    float flow_vel_y_cm_s;
     float throttle;
     float height_cm;
     float vel_z_cm_s;
+    float target_height_cm;
+    float target_vel_z_cm_s;
+    float final_height_cm;
+    float profile_height_cm;
+    float profile_vz_cm_s;
+    float height_loop_output_cm_s;
+    float height_loop_i_cm_s;
+    float vel_loop_output;
+    float vel_loop_i;
+    float throttle_pre_limit;
+    float throttle_post_limit;
+    float throttle_max;
     int16_t m1;
     int16_t m2;
     int16_t m3;
@@ -436,12 +477,35 @@ typedef struct {
     uint8_t search_active;
     uint8_t search_lost_frames;
     uint8_t search_found_frames;
+    uint8_t search_spiral_active;
+    uint8_t search_center_settled;
+    float search_center_distance_cm;
+    float search_center_speed_cm_s;
     uint8_t nav_state;
+    uint8_t flight_ready;
+    uint8_t beacon_track_state;
+    uint8_t beacon_track_seen_frames;
     uint8_t target_seq;
+    uint8_t car_follow_active;
+    uint8_t beacon_loss_brake_active;
+    uint8_t car_stop_brake_active;
+    float car_distance_cm;
+    float car_closing_speed_cm_s;
+    float car_brake_vel_cm_s;
+    float car_ff_vel_x_cm_s;
+    float car_ff_vel_y_cm_s;
+    float target_vel_x_cm_s;
+    float target_vel_y_cm_s;
     uint32_t car_tx_period_us;
     uint32_t car_rx_period_us;
     uint32_t car_tx_count;
     uint32_t car_rx_count;
+    int16_t car_tx_err_forward_px;
+    int16_t car_tx_err_right_px;
+    int16_t car_tx_yaw_earth_cdeg;
+    uint8_t car_tx_flags;
+    float car_yaw_body_deg;
+    uint8_t car_guidance_valid;
     uint8_t tof_raw_valid;
     uint8_t tof_stale;
     uint8_t tof_stream;
@@ -457,6 +521,9 @@ typedef struct {
     float pos_x_cm;
     float pos_y_cm;
 } debug_state_sample_t;
+
+typedef char debug_state_sample_must_fit_reserved_trace_window[
+    (sizeof(debug_state_sample_t) <= 0x1FCu) ? 1 : -1];
 
 /* A compact 50 Hz flight timeline.  It is intentionally independent of the
  * detailed state dump: the detailed buffer keeps PID context, while this
@@ -491,7 +558,13 @@ typedef struct {
     uint8_t phase;
 } debug_history_sample_t;
 
-static debug_state_sample_t debug_state_buf[DEBUG_STATE_LOG_SAMPLE_COUNT];
+/* Keep the full mission trace out of the CM7_1 camera DMA window
+ * 0x28026024..0x2802B843. With the attitude diagnostics below, the expected
+ * 0x1FC-byte sample keeps the 240-sample ring at
+ * 0x28030000..0x2804DC3F, inside CM7_0 RAM and below its heap/stack at
+ * 0x2807E000. Verify the exact extent in the post-build map. */
+#pragma location = 0x28030000
+__no_init static debug_state_sample_t debug_state_buf[DEBUG_STATE_LOG_SAMPLE_COUNT];
 static debug_history_sample_t debug_history_buf[DEBUG_HISTORY_SAMPLE_COUNT];
 static uint16_t debug_state_count = 0u;
 static uint16_t debug_state_dump_index = 0u;
@@ -555,7 +628,11 @@ void debug_capture_states_20ms(void)
         last_time_us = now_us;
     }
 
-    if(((armed == 0u) || (alt_phase == ALT_PHASE_LANDING)) &&
+    /* Keep the pre-descent settling window in the trace.  Once the gate
+     * releases, stop before the long blocking post-flight dump can grow. */
+    if(((armed == 0u) ||
+        ((alt_phase == ALT_PHASE_LANDING) &&
+         (auto_landing_active >= AUTO_LAND_STATE_DESCENDING))) &&
        (debug_state_recording != 0u))
     {
         debug_state_recording = 0u;
@@ -648,6 +725,20 @@ void debug_capture_states_20ms(void)
         sample->rate_tgt_p = att_1l_ct.exp_ang_vel[1];
         sample->rate_fb_p = att_1l_ct.fb_ang_vel[1];
         sample->rate_out_p = ct_val.pit;
+        sample->rate_p_p = att_ctrl.rate_pid[1].out_p;
+        sample->rate_i_p = att_ctrl.rate_pid[1].out_i;
+        sample->rate_d_p = att_ctrl.rate_pid[1].out_d;
+
+        sample->yaw_tgt = att_2l_ct.exp_yaw;
+        sample->yaw_err = att_2l_ct.yaw_err;
+        sample->rate_tgt_y = att_1l_ct.exp_ang_vel[2];
+        sample->rate_fb_y = att_1l_ct.fb_ang_vel[2];
+        sample->rate_out_y = ct_val.yaw;
+        sample->rate_p_y = att_ctrl.rate_pid[2].out_p;
+        sample->rate_i_y = att_ctrl.rate_pid[2].out_i;
+        sample->rate_d_y = att_ctrl.rate_pid[2].out_d;
+        sample->takeoff_yaw_rate_hold =
+            att_takeoff_yaw_rate_hold_active;
         
         {
             float imu_linear_acc_body[3];
@@ -664,10 +755,29 @@ void debug_capture_states_20ms(void)
         sample->flow_obs_valid = flow_health.obs_valid;
         sample->flow_ekf_used = flow_health.ekf_used;
         sample->flow_gate_clipped = flow_health.gate_clipped;
+        sample->flow_quality = flow_health.quality;
+        sample->flow_accum_count = flow_health.lc302_accum_count;
+        sample->flow_integration_us = flow_health.lc302_integration_us;
+        sample->flow_raw_dx_cm = flow_health.raw_dx_cm;
+        sample->flow_raw_dy_cm = flow_health.raw_dy_cm;
+        sample->flow_vel_x_cm_s = flow_health.flow_vel_x_cm_s;
+        sample->flow_vel_y_cm_s = flow_health.flow_vel_y_cm_s;
         
         sample->throttle = vehicle_setpoint.target_throttle;
         sample->height_cm = vehicle_state.current_height;
         sample->vel_z_cm_s = vehicle_state.current_vel_z;
+        sample->target_height_cm = vehicle_setpoint.target_height;
+        sample->target_vel_z_cm_s = vehicle_setpoint.target_vel_z;
+        sample->final_height_cm = alt_ctrl_debug.final_height;
+        sample->profile_height_cm = alt_ctrl_debug.profile_height;
+        sample->profile_vz_cm_s = alt_ctrl_debug.profile_velocity;
+        sample->height_loop_output_cm_s = alt_ctrl_debug.position_correction;
+        sample->height_loop_i_cm_s = alt_ctrl.height_pid.out_i;
+        sample->vel_loop_output = alt_ctrl_debug.pid_raw;
+        sample->vel_loop_i = alt_ctrl.vel_pid.out_i;
+        sample->throttle_pre_limit = alt_ctrl_debug.throttle_pre_limit;
+        sample->throttle_post_limit = alt_ctrl_debug.throttle_post_limit;
+        sample->throttle_max = alt_ctrl_debug.max_throttle;
         
         sample->m1 = motor_out.m1;
         sample->m2 = motor_out.m2;
@@ -686,12 +796,41 @@ void debug_capture_states_20ms(void)
         sample->search_lost_frames = vision_nav_obs.search_lost_frames;
         sample->search_found_frames = vision_nav_obs.search_found_frames;
 #endif
+        sample->search_spiral_active = vision_nav_obs.search_spiral_active;
+        sample->search_center_settled = vision_nav_obs.search_center_settled;
+        sample->search_center_distance_cm =
+            vision_nav_obs.search_center_distance_cm;
+        sample->search_center_speed_cm_s =
+            vision_nav_obs.search_center_speed_cm_s;
         sample->nav_state = (uint8_t)vision_nav_obs.state;
+        sample->flight_ready = vision_nav_obs.flight_ready;
+        sample->beacon_track_state = vision_nav_obs.beacon_track_state;
+        sample->beacon_track_seen_frames =
+            vision_nav_obs.beacon_track_seen_frames;
         sample->target_seq = vision_nav_obs.target_seq;
+        sample->car_follow_active = vision_nav_obs.car_follow_active;
+        sample->beacon_loss_brake_active =
+            vision_nav_obs.beacon_loss_brake_active;
+        sample->car_stop_brake_active =
+            vision_nav_obs.car_stop_brake_active;
+        sample->car_distance_cm = vision_nav_obs.car_distance_cm;
+        sample->car_closing_speed_cm_s =
+            vision_nav_obs.car_closing_speed_cm_s;
+        sample->car_brake_vel_cm_s = vision_nav_obs.car_brake_vel_cm_s;
+        sample->car_ff_vel_x_cm_s = vision_nav_obs.car_ff_vel_x_cm_s;
+        sample->car_ff_vel_y_cm_s = vision_nav_obs.car_ff_vel_y_cm_s;
+        sample->target_vel_x_cm_s = vehicle_setpoint.target_vel_x;
+        sample->target_vel_y_cm_s = vehicle_setpoint.target_vel_y;
         sample->car_tx_period_us = mcar_comm_diag.tx_period_us;
         sample->car_rx_period_us = mcar_comm_diag.rx_period_us;
         sample->car_tx_count = mcar_comm_diag.tx_count;
         sample->car_rx_count = mcar_comm_diag.rx_count;
+        sample->car_tx_err_forward_px = mcar_comm_diag.last_tx_err_forward_px;
+        sample->car_tx_err_right_px = mcar_comm_diag.last_tx_err_right_px;
+        sample->car_tx_yaw_earth_cdeg = mcar_comm_diag.last_tx_yaw_earth_cdeg;
+        sample->car_tx_flags = mcar_comm_diag.last_tx_flags;
+        sample->car_yaw_body_deg = mcar_guidance_diag.mcar_yaw_body_deg;
+        sample->car_guidance_valid = mcar_guidance_diag.valid;
         sample->tof_raw_valid = tof_health.raw_valid;
         sample->tof_stale = tof_health.stale;
         sample->tof_stream = tof_health.streamcount;
@@ -779,9 +918,32 @@ void debug_capture_states_20ms(void)
 
 static void debug_print_safety_snapshots(void)
 {
+    extern volatile uint8_t diag_pidwrite_pending;
+    extern volatile uint8_t diag_pidwrite_stage;
+    extern volatile uint32_t diag_pidwrite_time_us;
+    extern volatile uint32_t diag_pidwrite_before[3];
+    extern volatile uint32_t diag_pidwrite_after[3];
+
+    if(diag_pidwrite_pending != 0u)
+    {
+        printf("[PIDWRITE],time_us=%lu,stage=%u,before=%08lX/%08lX/%08lX,after=%08lX/%08lX/%08lX,mode=%u,alt_phase=%u,height_cm=%.2f\r\n",
+               (unsigned long)diag_pidwrite_time_us,
+               diag_pidwrite_stage,
+               (unsigned long)diag_pidwrite_before[0],
+               (unsigned long)diag_pidwrite_before[1],
+               (unsigned long)diag_pidwrite_before[2],
+               (unsigned long)diag_pidwrite_after[0],
+               (unsigned long)diag_pidwrite_after[1],
+               (unsigned long)diag_pidwrite_after[2],
+               (unsigned int)vehicle_state.flight_mode,
+               (unsigned int)alt_phase,
+               vehicle_state.current_height);
+        diag_pidwrite_pending = 0u;
+    }
+
     if(preflight_snapshot.pending != 0u)
     {
-        printf("[PREFLIGHT],attempt=%lu,result=%s,flags=0x%02X,time_us=%lu,mode=%u,voltage=%.2f,height_cm=%.2f,imu=%u,tof_ok=%u,tof_raw=%u,tof_stale=%u,tof_stuck=%u,tof_frames=%u,flow=%u,flow_raw=%u,flow_obs=%u,flow_ekf=%u,flow_quality=%u,flow_ready_ms=%.0f,lc302_bytes=%lu,lc302_frames=%lu,lc302_errors=%lu,lc302_last_rx_us=%lu,reason_imu=%u,reason_tof=%u,reason_flow_no_bytes=%u,reason_flow_no_frame=%u,reason_flow_quality=%u,reason_flow_not_ready=%u\r\n",
+        printf("[PREFLIGHT],attempt=%lu,result=%s,flags=0x%02X,time_us=%lu,mode=%u,voltage=%.2f,height_cm=%.2f,imu=%u,tof_ok=%u,tof_raw=%u,tof_stale=%u,tof_stuck=%u,tof_frames=%u,flow=%u,flow_raw=%u,flow_obs=%u,flow_ekf=%u,flow_quality=%u,flow_ready_ms=%.0f,lc302_bytes=%lu,lc302_frames=%lu,lc302_errors=%lu,lc302_last_rx_us=%lu,mcar_rx_irqs=%lu,mcar_fifo_polls=%lu,mcar_fifo_bytes=%lu,mcar_rx_bytes=%lu,mcar_rx_good=%lu,mcar_rx_bad=%lu,reason_imu=%u,reason_tof=%u,reason_flow_no_bytes=%u,reason_flow_no_frame=%u,reason_flow_quality=%u,reason_flow_not_ready=%u\r\n",
                (unsigned long)preflight_snapshot.attempt,
                (preflight_snapshot.accepted != 0u) ? "ACCEPTED" : "BLOCKED",
                preflight_snapshot.error_flags,
@@ -805,6 +967,12 @@ static void debug_print_safety_snapshots(void)
                (unsigned long)preflight_snapshot.lc302_frames,
                (unsigned long)preflight_snapshot.lc302_errors,
                (unsigned long)preflight_snapshot.lc302_last_rx_us,
+               (unsigned long)preflight_snapshot.mcar_rx_irqs,
+               (unsigned long)preflight_snapshot.mcar_hw_fifo_polls,
+               (unsigned long)preflight_snapshot.mcar_hw_fifo_bytes,
+               (unsigned long)preflight_snapshot.mcar_rx_bytes,
+               (unsigned long)preflight_snapshot.mcar_rx_good_frames,
+               (unsigned long)preflight_snapshot.mcar_rx_bad_frames,
                (preflight_snapshot.error_flags & PREFLIGHT_ERR_IMU) ? 1u : 0u,
                (preflight_snapshot.error_flags & PREFLIGHT_ERR_TOF) ? 1u : 0u,
                (preflight_snapshot.error_flags & PREFLIGHT_ERR_FLOW_NO_BYTES) ? 1u : 0u,
@@ -873,9 +1041,36 @@ void debug_print_states(void)
                "pos_x_cm,pos_y_cm,goal_x_cm,goal_y_cm,vel_x_cm_s,vel_y_cm_s,"
                "beacon,ycar,frame_id,rx_age_ms,cam_dt_us,vision_process_us,"
                "display_us,att_age_ms,search_active,lost_frames,found_frames,"
-               "nav_state,target_seq,car_tx_dt_us,car_rx_dt_us,"
-               "car_tx_count,car_rx_count,failsafe,tof_raw_cm,tof_raw_valid,"
-               "tof_stale,tof_stream,tof_recover,throttle,m1,m2,m3,m4\r\n");
+               "flow_quality,flow_accum_count,flow_integration_us,"
+               "flow_raw_dx_cm,flow_raw_dy_cm,"
+               "flow_vel_x_cm_s,flow_vel_y_cm_s,flow_gate_clipped,"
+               "search_scan_active,search_center_settled,"
+               "search_center_distance_cm,search_center_speed_cm_s,"
+               "nav_state,flight_ready,beacon_track_state,"
+               "beacon_track_seen_frames,target_seq,"
+               "car_follow_active,beacon_loss_brake_active,"
+               "car_stop_brake_active,car_distance_cm,"
+               "car_closing_speed_cm_s,car_brake_vel_cm_s,"
+               "car_ff_vel_x_cm_s,car_ff_vel_y_cm_s,"
+               "target_vel_x_cm_s,target_vel_y_cm_s,"
+               "car_tx_dt_us,car_rx_dt_us,"
+               "car_tx_count,car_rx_count,car_err_fwd_px,car_err_right_px,"
+               "car_yaw_body_deg,car_yaw_earth_deg,car_tx_flags,car_guidance_valid,"
+               "failsafe,tof_raw_cm,tof_raw_valid,"
+               "tof_stale,tof_stream,tof_recover,throttle,"
+               "target_height_cm,current_vel_z_cm_s,target_vel_z_cm_s,"
+               "final_height_cm,profile_height_cm,profile_vz_cm_s,"
+               "height_loop_output_cm_s,height_loop_i_cm_s,"
+               "vel_loop_output,vel_loop_i,throttle_pre_limit,"
+               "throttle_post_limit,throttle_max,m1,m2,m3,m4,"
+               "att_voltage_scale,yaw_target_deg,yaw_err_deg,"
+               "rate_tgt_roll_dps,rate_fb_roll_dps,rate_out_roll,"
+               "rate_p_roll,rate_i_roll,rate_d_roll,"
+               "rate_tgt_pitch_dps,rate_fb_pitch_dps,rate_out_pitch,"
+               "rate_p_pitch,rate_i_pitch,rate_d_pitch,"
+               "rate_tgt_yaw_dps,rate_fb_yaw_dps,rate_out_yaw,"
+               "rate_p_yaw,rate_i_yaw,rate_d_yaw,"
+               "takeoff_yaw_rate_hold\r\n");
     }
 
     while((debug_state_dump_index < debug_state_count) && (lines < 10u))
@@ -897,8 +1092,14 @@ void debug_print_states(void)
                "%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,"
                "%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,"
                "%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,"
-               "%u,%u,%lu,%lu,%lu,%lu,%u,%.1f,%u,%u,%u,%lu,"
-               "%.2f,%d,%d,%d,%d\r\n",
+               "%u,%u,%lu,%.3f,%.3f,%.1f,%.1f,%u,"
+               "%u,%u,%.1f,%.1f,"
+               "%u,%u,%u,%u,%u,%u,%u,%u,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%lu,%lu,%lu,%lu,%d,%d,%.2f,%.2f,0x%02X,%u,%u,%.1f,%u,%u,%u,%lu,"
+               "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,"
+               "%.3f,%.3f,%.3f,"
+               "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+               "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+               "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u\r\n",
                (unsigned long)sample->time_us,
                (unsigned int)sample->armed,
                (unsigned int)sample->flight_mode,
@@ -930,12 +1131,43 @@ void debug_print_states(void)
                (unsigned int)sample->search_active,
                (unsigned int)sample->search_lost_frames,
                (unsigned int)sample->search_found_frames,
+               (unsigned int)sample->flow_quality,
+               (unsigned int)sample->flow_accum_count,
+               (unsigned long)sample->flow_integration_us,
+               sample->flow_raw_dx_cm,
+               sample->flow_raw_dy_cm,
+               sample->flow_vel_x_cm_s,
+               sample->flow_vel_y_cm_s,
+               (unsigned int)sample->flow_gate_clipped,
+               (unsigned int)sample->search_spiral_active,
+               (unsigned int)sample->search_center_settled,
+               sample->search_center_distance_cm,
+               sample->search_center_speed_cm_s,
                (unsigned int)sample->nav_state,
+               (unsigned int)sample->flight_ready,
+               (unsigned int)sample->beacon_track_state,
+               (unsigned int)sample->beacon_track_seen_frames,
                (unsigned int)sample->target_seq,
+               (unsigned int)sample->car_follow_active,
+               (unsigned int)sample->beacon_loss_brake_active,
+               (unsigned int)sample->car_stop_brake_active,
+               sample->car_distance_cm,
+               sample->car_closing_speed_cm_s,
+               sample->car_brake_vel_cm_s,
+               sample->car_ff_vel_x_cm_s,
+               sample->car_ff_vel_y_cm_s,
+               sample->target_vel_x_cm_s,
+               sample->target_vel_y_cm_s,
                (unsigned long)sample->car_tx_period_us,
                (unsigned long)sample->car_rx_period_us,
                (unsigned long)sample->car_tx_count,
                (unsigned long)sample->car_rx_count,
+               sample->car_tx_err_forward_px,
+               sample->car_tx_err_right_px,
+               sample->car_yaw_body_deg,
+               (float)sample->car_tx_yaw_earth_cdeg * 0.01f,
+               (unsigned int)sample->car_tx_flags,
+               (unsigned int)sample->car_guidance_valid,
                (unsigned int)sample->failsafe_flags,
                sample->tof_raw_cm,
                (unsigned int)sample->tof_raw_valid,
@@ -943,10 +1175,45 @@ void debug_print_states(void)
                (unsigned int)sample->tof_stream,
                (unsigned long)sample->tof_recovery_count,
                sample->throttle,
+               sample->target_height_cm,
+               sample->vel_z_cm_s,
+               sample->target_vel_z_cm_s,
+               sample->final_height_cm,
+               sample->profile_height_cm,
+               sample->profile_vz_cm_s,
+               sample->height_loop_output_cm_s,
+               sample->height_loop_i_cm_s,
+               sample->vel_loop_output,
+               sample->vel_loop_i,
+               sample->throttle_pre_limit,
+               sample->throttle_post_limit,
+               sample->throttle_max,
                sample->m1,
                sample->m2,
                sample->m3,
-               sample->m4);
+               sample->m4,
+               sample->att_voltage_scale,
+               sample->yaw_tgt,
+               sample->yaw_err,
+               sample->rate_tgt_r,
+               sample->rate_fb_r,
+               sample->rate_out_r,
+               sample->rate_p_r,
+               sample->rate_i_r,
+               sample->rate_d_r,
+               sample->rate_tgt_p,
+               sample->rate_fb_p,
+               sample->rate_out_p,
+               sample->rate_p_p,
+               sample->rate_i_p,
+               sample->rate_d_p,
+               sample->rate_tgt_y,
+               sample->rate_fb_y,
+               sample->rate_out_y,
+               sample->rate_p_y,
+               sample->rate_i_y,
+               sample->rate_d_y,
+               (unsigned int)sample->takeoff_yaw_rate_hold);
 
         debug_state_dump_index++;
         lines++;
@@ -955,7 +1222,128 @@ void debug_print_states(void)
     if(debug_state_dump_index >= debug_state_count)
     {
         debug_print_safety_snapshots();
+        /* Keep runtime identity inside the MISSION block.  Consumers often
+         * capture through MISSION_LOG_END only, and this mission-specific
+         * branch returns before the legacy HISTORY/config emitter below. */
+        printf("FLIGHTCFG,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f\r\n",
+               att_ctrl.angle_pid[0].kp, att_ctrl.angle_pid[1].kp, att_ctrl.angle_pid[2].kp,
+               att_ctrl.rate_pid[0].kp, att_ctrl.rate_pid[0].ki, att_ctrl.rate_pid[0].kd,
+               att_ctrl.rate_pid[1].kp, att_ctrl.rate_pid[1].ki, att_ctrl.rate_pid[1].kd,
+               att_ctrl.rate_pid[2].kp, att_ctrl.rate_pid[2].ki, att_ctrl.rate_pid[2].kd,
+               loc_ctrl.pos_pid[0].kp, loc_ctrl.pos_pid[0].ki, loc_ctrl.pos_pid[0].kd,
+               loc_ctrl.pos_pid[1].kp, loc_ctrl.pos_pid[1].ki, loc_ctrl.pos_pid[1].kd,
+               loc_ctrl.vel_pid[0].kp, loc_ctrl.vel_pid[0].ki, loc_ctrl.vel_pid[0].kd,
+               loc_ctrl.vel_pid[1].kp, loc_ctrl.vel_pid[1].ki, loc_ctrl.vel_pid[1].kd,
+               alt_ctrl.vel_pid.kp, alt_ctrl.vel_pid.ki, alt_ctrl.vel_pid.kd,
+               LOC_MAX_OUTPUT_ANGLE_DEG, MAX_HORIZONTAL_SPEED);
+        printf("FLOWCFG,scale_x=%.4f,scale_y=%.4f,quality_min=%u\r\n",
+               LC302_FLOW_SCALE_X,
+               LC302_FLOW_SCALE_Y,
+               (unsigned int)LC302_QUALITY_MIN);
+        printf("ATTCTRL_CFG,takeoff_yaw_mode=rate_hold_below_cm,takeoff_yaw_heading_enable_cm=%.1f,heading_handoff=capture_current,roll_pitch_pid_unchanged=1\r\n",
+               ATT_TAKEOFF_YAW_HEADING_ENABLE_HEIGHT_CM);
+        printf("IMUCFG,mount_yaw_deg=%.1f,mount_yaw_positive=clockwise_top_view,gyro_acc_xy_same_rotation=1\r\n",
+               IMU_MOUNT_YAW_DEG);
+        printf("PROFILECFG,pos_correction_cm_s=%.1f,terminal_pos_correction_cm_s=%.1f,terminal_total_vel_cm_s=%.1f,terminal_radius_cm=%.1f,terminal_cruise_radius_cm=%.1f,profile_near_cm_s=%.1f,profile_far_cm_s=%.1f,total_vel_cm_s=%.1f,target_vel_slew_cm_s2=%.1f,car_stop_brake_slew_cm_s2=%.1f,traj_accel_cm_s2=%.1f,max_accel_cm_s2=%.1f,max_angle_deg=%.1f,terminal_damping_scale=%.2f,height_recovery_relative_speed_cm_s=%.1f\r\n",
+               LOC_POS_CORRECTION_LIMIT_CM_S,
+               LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S,
+               LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S,
+               LOC_TERMINAL_APPROACH_RADIUS_CM,
+               LOC_TERMINAL_CRUISE_RADIUS_CM,
+               LOC_PROFILE_NEAR_SPEED_CM_S,
+               LOC_PROFILE_FAR_SPEED_CM_S,
+               LOC_TOTAL_VEL_LIMIT_CM_S,
+               LOC_TARGET_VEL_SLEW_CM_S2,
+               LOC_CAR_STOP_BRAKE_VEL_SLEW_CM_S2,
+               LOC_TRAJ_ACCEL_CM_S2,
+               LOC_MAX_HORIZONTAL_ACCEL_CM_S2,
+               LOC_MAX_OUTPUT_ANGLE_DEG,
+               LOC_TERMINAL_VEL_DAMPING_SCALE,
+               MISSION_HEIGHT_RECOVERY_RELATIVE_SPEED_LIMIT_CM_S);
+        printf("NAVCFG,search_pattern=simple_finish_v2,direct_car_follow=%u,direct_target_mode=latched_increment,local_serpentine=%u,after_center=%s,search_center_x_cm=%.1f,search_center_y_cm=%.1f,search_center_capture_cm=%.1f,search_center_max_speed_cm_s=%.1f,search_center_settle_ms=%lu,search_hard_half_x_cm=%.1f,search_hard_half_y_cm=%.1f,search_scan_half_x_cm=%.1f,search_scan_half_y_cm=%.1f,search_inset_cm=%.1f,search_waypoint_capture_cm=%.1f,search_speed_limit_cm_s=%.1f,direct_px_to_cm=%.2f,direct_lpf_alpha=%.2f,direct_max_jump_px=%.1f,direct_deadzone_px=%.1f,direct_target_step_cm=%.2f,direct_target_leash_cm=%.1f,car_follow_speed_limit_cm_s=%.1f,takeoff_horizontal_enable_cm=%.1f,takeoff_horizontal_release_cm=%.1f,takeoff_hold_capture=current,takeoff_initial_angle_deg=%.1f,takeoff_initial_angle_until_cm=%.1f,takeoff_fault_guard=brake_no_land,horiz_fault_speed_cm_s=%.1f,horiz_fault_critical_cm_s=%.1f,horiz_fault_bad_frames=%u,horiz_fault_clear_cm_s=%.1f,horiz_fault_land_ms=%lu,horiz_fault_angle_deg=%.1f\r\n",
+               (unsigned int)VISION_NAV_SIMPLE_DIRECT_CAR_FOLLOW,
+               (unsigned int)VISION_NAV_LOCAL_SERPENTINE_ENABLE,
+               (VISION_NAV_LOCAL_SERPENTINE_ENABLE != 0) ?
+                   "serpentine" : "hold",
+               VISION_NAV_SEARCH_CENTER_X_CM,
+               VISION_NAV_SEARCH_CENTER_Y_CM,
+               VISION_NAV_SEARCH_CENTER_CAPTURE_CM,
+               VISION_NAV_SEARCH_CENTER_MAX_SPEED_CM_S,
+               (unsigned long)(VISION_NAV_SEARCH_CENTER_SETTLE_US / 1000u),
+               VISION_NAV_SEARCH_HALF_WIDTH_X_CM,
+               VISION_NAV_SEARCH_HALF_WIDTH_Y_CM,
+               VISION_NAV_SEARCH_SCAN_HALF_WIDTH_X_CM,
+               VISION_NAV_SEARCH_SCAN_HALF_WIDTH_Y_CM,
+               VISION_NAV_SEARCH_GEOFENCE_INSET_CM,
+               VISION_NAV_SEARCH_WAYPOINT_CAPTURE_CM,
+               VISION_NAV_SEARCH_SPEED_LIMIT_CM_S,
+               VISION_NAV_DIRECT_CAR_PX_TO_CM,
+               VISION_NAV_DIRECT_CAR_LPF_ALPHA,
+               VISION_NAV_DIRECT_CAR_MAX_JUMP_PX,
+               VISION_NAV_DIRECT_CAR_DEADZONE_PX,
+               VISION_NAV_DIRECT_CAR_TARGET_STEP_CM,
+               VISION_NAV_DIRECT_CAR_TARGET_LEASH_CM,
+               VISION_NAV_CAR_FOLLOW_SPEED_LIMIT_CM_S,
+               LOC_AUTO_TAKEOFF_HORIZONTAL_ENABLE_HEIGHT_CM,
+               LOC_AUTO_TAKEOFF_HORIZONTAL_RELEASE_HEIGHT_CM,
+               LOC_AUTO_TAKEOFF_INITIAL_MAX_OUTPUT_ANGLE_DEG,
+               LOC_AUTO_TAKEOFF_INITIAL_ANGLE_LIMIT_HEIGHT_CM,
+               VISION_NAV_HORIZONTAL_FAULT_SPEED_CM_S,
+               VISION_NAV_HORIZONTAL_FAULT_CRITICAL_SPEED_CM_S,
+               (unsigned int)VISION_NAV_HORIZONTAL_FAULT_BAD_FRAMES,
+               VISION_NAV_HORIZONTAL_FAULT_CLEAR_SPEED_CM_S,
+               (unsigned long)(VISION_NAV_HORIZONTAL_FAULT_LAND_US / 1000u),
+               LOC_HORIZONTAL_FAULT_MAX_ANGLE_DEG);
+        printf("FAILSAFECFG,imu_confirm_ms=%lu,tof_confirm_ms=%lu,flow_confirm_ms=%lu,remote_land_switch=immediate,horiz_fault_land_ms=%lu,radio_loss_autoland=%u\r\n",
+               (unsigned long)(FLIGHT_FAILSAFE_IMU_CONFIRM_S * 1000.0f),
+               (unsigned long)(FLIGHT_FAILSAFE_TOF_CONFIRM_S * 1000.0f),
+               (unsigned long)(FLIGHT_FAILSAFE_FLOW_CONFIRM_S * 1000.0f),
+               (unsigned long)(VISION_NAV_HORIZONTAL_FAULT_LAND_US / 1000u),
+               (unsigned int)RADIO_LOSS_AUTOLAND_ENABLE);
+        printf("BEACONPLANCFG,center_policy=%u,center_radius_cm=%.1f,center_only_frames=%u,observation_backoff_cm=%.1f,return_center_after_target=1,locked_candidate_radius_px=%d\r\n",
+               (unsigned int)VISION_NAV_CENTER_BEACON_POLICY_ENABLE,
+               VISION_NAV_CENTER_BEACON_RADIUS_CM,
+               (unsigned int)VISION_NAV_CENTER_ONLY_CONFIRM_FRAMES,
+               VISION_NAV_CENTER_OBSERVATION_BACKOFF_CM,
+               VISION_NAV_LOCKED_CANDIDATE_RADIUS_PX);
+        printf("YAWPOSCFG,pos_gain_scale=%.2f,pos_correction_limit_cm_s=%.1f,total_vel_limit_cm_s=%.1f,angle_limit_deg=%.1f,spin_mode=segmented_3x120,segment_deg=%.1f,segment_pause_ms=%lu,finish_tolerance_deg=%.1f,settle_ms=%lu\r\n",
+               LOC_YAW_SPIN_POS_GAIN_SCALE,
+               LOC_YAW_SPIN_POS_CORRECTION_LIMIT_CM_S,
+               LOC_YAW_SPIN_TOTAL_VEL_LIMIT_CM_S,
+               VISION_NAV_YAW_SPIN_LOC_ANGLE_DEG,
+               VISION_NAV_YAW_SPIN_SEGMENT_DEG,
+               (unsigned long)(VISION_NAV_YAW_SPIN_SEGMENT_PAUSE_US / 1000u),
+               VISION_NAV_YAW_SPIN_FINISH_TOLERANCE_DEG,
+               (unsigned long)(VISION_NAV_YAW_SPIN_SETTLE_US / 1000u));
+        printf("YAWLOADCFG,enabled=%u,target_rate_dps=%.1f,max_rate_dps=%.1f,ct_limit=%.1f,recovery_mode=pause_resume,recovery_trigger_height_cm=%.1f,recovery_trigger_vz_cm_s=%.1f,recovery_resume_height_cm=%.1f,recovery_resume_vz_cm_s=%.1f\r\n",
+               (unsigned int)VISION_NAV_YAW_SPIN_ENABLE,
+               VISION_NAV_YAW_SPIN_RATE_DPS,
+               VISION_NAV_YAW_SPIN_MAX_RATE_DPS,
+               VISION_NAV_YAW_SPIN_CT_LIMIT,
+               VISION_NAV_YAW_SPIN_RECOVERY_TRIGGER_HEIGHT_CM,
+               VISION_NAV_YAW_SPIN_RECOVERY_TRIGGER_VZ_CM_S,
+               VISION_NAV_YAW_SPIN_RECOVERY_RESUME_HEIGHT_CM,
+               VISION_NAV_YAW_SPIN_RECOVERY_RESUME_VZ_CM_S);
+        printf("TAKEOFFPOSCFG,damping_enable_cm=%.1f,hold_enable_cm=%.1f,release_cm=%.1f,preserve_launch_target=1,initial_angle_limit_deg=%.1f\r\n",
+               LOC_AUTO_TAKEOFF_HORIZONTAL_ENABLE_HEIGHT_CM,
+               LOC_AUTO_LOW_HOLD_HEIGHT_CM,
+               LOC_AUTO_TAKEOFF_HORIZONTAL_RELEASE_HEIGHT_CM,
+               LOC_AUTO_TAKEOFF_INITIAL_MAX_OUTPUT_ANGLE_DEG);
+        printf("CARCMDCFG,aircraft_tx_shaper=%u,command_px=%d,slew_px_per_frame=%d,preserve_vector_ratio=1,force_recovery_slow=%u,handheld_follow_test=%u,handheld_beacon_follow_test=%u,che_pos_to_speed=8,che_arrive_threshold_px=5,expected_dominant_axis_cm_s=40\r\n",
+               (unsigned int)MCAR_COMM_TX_SHAPER_ENABLE,
+               MCAR_COMM_TX_SHAPER_COMMAND_PX,
+               MCAR_COMM_TX_SHAPER_SLEW_PX_PER_FRAME,
+               (unsigned int)MCAR_COMM_TX_SHAPER_FORCE_SLOW_FLAG,
+               (unsigned int)MCAR_COMM_HANDHELD_FOLLOW_TEST_ENABLE,
+               (unsigned int)MCAR_COMM_HANDHELD_BEACON_FOLLOW_TEST_ENABLE);
+        printf("LANDCFG,pre_descent_settle=1,horiz_speed_cm_s=%.1f,pos_err_cm=%.1f,vz_cm_s=%.1f,stable_ms=%lu,timeout_ms=%lu,fault_bypass=1,takeoff_gate_separate=1\r\n",
+               AUTO_LAND_SETTLE_HORIZ_SPEED_CM_S,
+               AUTO_LAND_SETTLE_POS_ERR_CM,
+               AUTO_LAND_SETTLE_VZ_CM_S,
+               (unsigned long)(AUTO_LAND_SETTLE_STABLE_TIME_S * 1000.0f),
+               (unsigned long)(AUTO_LAND_SETTLE_TIMEOUT_S * 1000.0f));
         printf("MISSION_LOG_END\r\n");
+        printf("DEBUG_STATE_END\r\n");
         debug_state_ready = 0u;
         debug_state_count = 0u;
         debug_state_dump_index = 0u;
@@ -998,7 +1386,7 @@ void debug_print_states(void)
                "beacon,ycar,frame_id,rx_age_ms,cam_dt_us,vision_process_us,"
                "display_us,att_age_ms,search_active,lost_frames,"
                "found_frames,nav_state,target_seq,car_fb,car_status,"
-               "car_err_fwd_px,car_err_right_px\r\n");
+               "car_speed_fwd_cm_s,car_speed_right_cm_s\r\n");
         mission_header_printed = 1u;
     }
 
@@ -1057,8 +1445,8 @@ void debug_print_states(void)
            (unsigned int)vision_nav_obs.target_seq,
            (unsigned int)mcar_comm_feedback.valid,
            (unsigned int)mcar_comm_feedback.status,
-           (int)mcar_comm_feedback.err_forward_px,
-           (int)mcar_comm_feedback.err_right_px);
+           (int)mcar_comm_feedback.speed_forward_cm_s,
+           (int)mcar_comm_feedback.speed_right_cm_s);
     return;
 #endif
 
@@ -1244,7 +1632,7 @@ void debug_print_states(void)
                alt_ctrl.vel_pid.kp, alt_ctrl.vel_pid.ki, alt_ctrl.vel_pid.kd,
                LOC_MAX_OUTPUT_ANGLE_DEG, MAX_HORIZONTAL_SPEED);
         printf("LOCBIASCFG,enabled=0,steady_bias_source=VEL_I,i_max_cm_s2=20.0\r\n");
-        printf("PROFILECFG,pos_correction_cm_s=%.1f,terminal_pos_correction_cm_s=%.1f,terminal_total_vel_cm_s=%.1f,terminal_radius_cm=%.1f,terminal_cruise_radius_cm=%.1f,profile_near_cm_s=%.1f,profile_far_cm_s=%.1f,total_vel_cm_s=%.1f,leash_start_cm=%.1f,leash_max_cm=%.1f,leash_min_speed_scale=%.2f,opposing_ff=blocked,recovery_brake=enabled,terminal_hold=direct_pd,terminal_damping_scale=%.2f,brake_margin_cm_s=%.1f,brake_slew_cm_s2=%.1f,brake_accel_cm_s2=%.1f\r\n",
+        printf("PROFILECFG,pos_correction_cm_s=%.1f,terminal_pos_correction_cm_s=%.1f,terminal_total_vel_cm_s=%.1f,terminal_radius_cm=%.1f,terminal_cruise_radius_cm=%.1f,profile_near_cm_s=%.1f,profile_far_cm_s=%.1f,total_vel_cm_s=%.1f,leash_start_cm=%.1f,leash_max_cm=%.1f,leash_min_speed_scale=%.2f,opposing_ff=blocked,recovery_brake=enabled,terminal_hold=direct_pd,terminal_damping_scale=%.2f,brake_margin_cm_s=%.1f,brake_slew_cm_s2=%.1f,car_stop_brake_slew_cm_s2=%.1f,brake_accel_cm_s2=%.1f\r\n",
                LOC_POS_CORRECTION_LIMIT_CM_S,
                LOC_TERMINAL_POS_CORRECTION_LIMIT_CM_S,
                LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S,
@@ -1259,7 +1647,80 @@ void debug_print_states(void)
                LOC_TERMINAL_VEL_DAMPING_SCALE,
                LOC_RECOVERY_BRAKE_MARGIN_CM_S,
                LOC_RECOVERY_BRAKE_VEL_SLEW_CM_S2,
+               LOC_CAR_STOP_BRAKE_VEL_SLEW_CM_S2,
                LOC_TRAJ_ACCEL_CM_S2);
+        printf("NAVCFG,search_pattern=simple_finish_v2,direct_car_follow=%u,direct_target_mode=latched_increment,local_serpentine=%u,after_center=%s,search_center_capture_cm=%.1f,search_center_max_speed_cm_s=%.1f,search_center_settle_ms=%lu,search_half_x_cm=%.1f,search_half_y_cm=%.1f,search_waypoint_capture_cm=%.1f,search_speed_limit_cm_s=%.1f,direct_px_to_cm=%.2f,direct_lpf_alpha=%.2f,direct_max_jump_px=%.1f,direct_deadzone_px=%.1f,direct_target_step_cm=%.2f,direct_target_leash_cm=%.1f,car_follow_speed_limit_cm_s=%.1f,alt_vel_ff_gain=%.3f,takeoff_horizontal_enable_cm=%.1f,takeoff_horizontal_release_cm=%.1f,takeoff_hold_capture=current,takeoff_initial_angle_deg=%.1f,takeoff_initial_angle_until_cm=%.1f,takeoff_fault_guard=brake_no_land,horiz_fault_speed_cm_s=%.1f,horiz_fault_critical_cm_s=%.1f,horiz_fault_bad_frames=%u,horiz_fault_clear_cm_s=%.1f,horiz_fault_land_ms=%lu,horiz_fault_angle_deg=%.1f\r\n",
+               (unsigned int)VISION_NAV_SIMPLE_DIRECT_CAR_FOLLOW,
+               (unsigned int)VISION_NAV_LOCAL_SERPENTINE_ENABLE,
+               (VISION_NAV_LOCAL_SERPENTINE_ENABLE != 0) ?
+                   "serpentine" : "hold",
+               VISION_NAV_SEARCH_CENTER_CAPTURE_CM,
+               VISION_NAV_SEARCH_CENTER_MAX_SPEED_CM_S,
+               (unsigned long)(VISION_NAV_SEARCH_CENTER_SETTLE_US / 1000u),
+               VISION_NAV_SEARCH_HALF_WIDTH_X_CM,
+               VISION_NAV_SEARCH_HALF_WIDTH_Y_CM,
+               VISION_NAV_SEARCH_WAYPOINT_CAPTURE_CM,
+               VISION_NAV_SEARCH_SPEED_LIMIT_CM_S,
+               VISION_NAV_DIRECT_CAR_PX_TO_CM,
+               VISION_NAV_DIRECT_CAR_LPF_ALPHA,
+               VISION_NAV_DIRECT_CAR_MAX_JUMP_PX,
+               VISION_NAV_DIRECT_CAR_DEADZONE_PX,
+               VISION_NAV_DIRECT_CAR_TARGET_STEP_CM,
+               VISION_NAV_DIRECT_CAR_TARGET_LEASH_CM,
+               VISION_NAV_CAR_FOLLOW_SPEED_LIMIT_CM_S,
+               ALT_VEL_FEEDFORWARD_GAIN,
+               LOC_AUTO_TAKEOFF_HORIZONTAL_ENABLE_HEIGHT_CM,
+               LOC_AUTO_TAKEOFF_HORIZONTAL_RELEASE_HEIGHT_CM,
+               LOC_AUTO_TAKEOFF_INITIAL_MAX_OUTPUT_ANGLE_DEG,
+               LOC_AUTO_TAKEOFF_INITIAL_ANGLE_LIMIT_HEIGHT_CM,
+               VISION_NAV_HORIZONTAL_FAULT_SPEED_CM_S,
+               VISION_NAV_HORIZONTAL_FAULT_CRITICAL_SPEED_CM_S,
+               (unsigned int)VISION_NAV_HORIZONTAL_FAULT_BAD_FRAMES,
+               VISION_NAV_HORIZONTAL_FAULT_CLEAR_SPEED_CM_S,
+               (unsigned long)(VISION_NAV_HORIZONTAL_FAULT_LAND_US / 1000u),
+               LOC_HORIZONTAL_FAULT_MAX_ANGLE_DEG);
+        printf("FAILSAFECFG,imu_confirm_ms=%lu,tof_confirm_ms=%lu,flow_confirm_ms=%lu,remote_land_switch=immediate,horiz_fault_land_ms=%lu,radio_loss_autoland=%u\r\n",
+               (unsigned long)(FLIGHT_FAILSAFE_IMU_CONFIRM_S * 1000.0f),
+               (unsigned long)(FLIGHT_FAILSAFE_TOF_CONFIRM_S * 1000.0f),
+               (unsigned long)(FLIGHT_FAILSAFE_FLOW_CONFIRM_S * 1000.0f),
+               (unsigned long)(VISION_NAV_HORIZONTAL_FAULT_LAND_US / 1000u),
+               (unsigned int)RADIO_LOSS_AUTOLAND_ENABLE);
+        printf("BEACONPLANCFG,center_policy=%u,center_radius_cm=%.1f,center_only_frames=%u,observation_backoff_cm=%.1f,return_center_after_target=1,locked_candidate_radius_px=%d\r\n",
+               (unsigned int)VISION_NAV_CENTER_BEACON_POLICY_ENABLE,
+               VISION_NAV_CENTER_BEACON_RADIUS_CM,
+               (unsigned int)VISION_NAV_CENTER_ONLY_CONFIRM_FRAMES,
+               VISION_NAV_CENTER_OBSERVATION_BACKOFF_CM,
+               VISION_NAV_LOCKED_CANDIDATE_RADIUS_PX);
+        printf("YAWPOSCFG,pos_gain_scale=%.2f,pos_correction_limit_cm_s=%.1f,total_vel_limit_cm_s=%.1f,angle_limit_deg=%.1f,spin_mode=segmented_3x120,segment_deg=%.1f,segment_pause_ms=%lu,finish_tolerance_deg=%.1f,settle_ms=%lu\r\n",
+               LOC_YAW_SPIN_POS_GAIN_SCALE,
+               LOC_YAW_SPIN_POS_CORRECTION_LIMIT_CM_S,
+               LOC_YAW_SPIN_TOTAL_VEL_LIMIT_CM_S,
+               VISION_NAV_YAW_SPIN_LOC_ANGLE_DEG,
+               VISION_NAV_YAW_SPIN_SEGMENT_DEG,
+               (unsigned long)(VISION_NAV_YAW_SPIN_SEGMENT_PAUSE_US / 1000u),
+               VISION_NAV_YAW_SPIN_FINISH_TOLERANCE_DEG,
+               (unsigned long)(VISION_NAV_YAW_SPIN_SETTLE_US / 1000u));
+        printf("YAWLOADCFG,enabled=%u,target_rate_dps=%.1f,max_rate_dps=%.1f,ct_limit=%.1f,recovery_mode=pause_resume,recovery_trigger_height_cm=%.1f,recovery_trigger_vz_cm_s=%.1f,recovery_resume_height_cm=%.1f,recovery_resume_vz_cm_s=%.1f\r\n",
+               (unsigned int)VISION_NAV_YAW_SPIN_ENABLE,
+               VISION_NAV_YAW_SPIN_RATE_DPS,
+               VISION_NAV_YAW_SPIN_MAX_RATE_DPS,
+               VISION_NAV_YAW_SPIN_CT_LIMIT,
+               VISION_NAV_YAW_SPIN_RECOVERY_TRIGGER_HEIGHT_CM,
+               VISION_NAV_YAW_SPIN_RECOVERY_TRIGGER_VZ_CM_S,
+               VISION_NAV_YAW_SPIN_RECOVERY_RESUME_HEIGHT_CM,
+               VISION_NAV_YAW_SPIN_RECOVERY_RESUME_VZ_CM_S);
+        printf("TAKEOFFPOSCFG,damping_enable_cm=%.1f,hold_enable_cm=%.1f,release_cm=%.1f,preserve_launch_target=1,initial_angle_limit_deg=%.1f\r\n",
+               LOC_AUTO_TAKEOFF_HORIZONTAL_ENABLE_HEIGHT_CM,
+               LOC_AUTO_LOW_HOLD_HEIGHT_CM,
+               LOC_AUTO_TAKEOFF_HORIZONTAL_RELEASE_HEIGHT_CM,
+               LOC_AUTO_TAKEOFF_INITIAL_MAX_OUTPUT_ANGLE_DEG);
+        printf("CARCMDCFG,aircraft_tx_shaper=%u,command_px=%d,slew_px_per_frame=%d,preserve_vector_ratio=1,force_recovery_slow=%u,handheld_follow_test=%u,handheld_beacon_follow_test=%u,che_pos_to_speed=8,che_arrive_threshold_px=5,expected_dominant_axis_cm_s=40\r\n",
+               (unsigned int)MCAR_COMM_TX_SHAPER_ENABLE,
+               MCAR_COMM_TX_SHAPER_COMMAND_PX,
+               MCAR_COMM_TX_SHAPER_SLEW_PX_PER_FRAME,
+               (unsigned int)MCAR_COMM_TX_SHAPER_FORCE_SLOW_FLAG,
+               (unsigned int)MCAR_COMM_HANDHELD_FOLLOW_TEST_ENABLE,
+               (unsigned int)MCAR_COMM_HANDHELD_BEACON_FOLLOW_TEST_ENABLE);
         debug_print_safety_snapshots();
         printf("DEBUG_STATE_END\r\n");
         debug_state_ready = 0u;
@@ -1281,7 +1742,14 @@ void debug_print_states(void)
 void param_update(float dT_s)
 {
     static float mission_cruise_stable_time_s = 0.0f;
-    static uint8_t mission_cruise_ready = 0u;
+    static float mission_height_recovery_stable_time_s = 0.0f;
+    static float auto_land_settle_time_s = 0.0f;
+    static float auto_land_wait_time_s = 0.0f;
+    static float auto_land_target_x_cm = 0.0f;
+    static float auto_land_target_y_cm = 0.0f;
+    static float auto_land_hold_height_cm = MIN_HEIGHT;
+    static uint8_t mission_mode_active_last = 0u;
+    static uint8_t mission_start_ready_latched = 0u;
     if(dT_s <= 0.0f || dT_s > 0.1f)
     {
         dT_s = REMOTE_SAMPLE_TIME;
@@ -1294,12 +1762,26 @@ void param_update(float dT_s)
     // 1. 解析遥控器数据，获得干净的杆量输入 `manual_input`
     prase_remote_ctrl_data(dT_s);
 
+    /* Camera code only publishes vision_detection_snapshot.  Horizontal
+     * setpoints must be owned by this 20 ms control cycle: calling
+     * vision_nav_update() from the asynchronous frame consumer let a new
+     * frame overwrite a target between two LOC updates, producing one-frame
+     * waypoint jumps during pre-mission Y-car alignment. */
+    vision_nav_update();
+
     // 安全保护：未解锁时，所有期望值贴住当前状态，避免解锁瞬间跳变。
     if (vehicle_state.armed == 0)
     {
         mission_cruise_stable_time_s = 0.0f;
+        mission_height_recovery_stable_time_s = 0.0f;
         mission_cruise_ready = 0u;
-        auto_landing_active = 0;
+        mission_mode_active_last = 0u;
+        mission_start_ready_latched = 0u;
+        mission_task_requested = 0u;
+        mission_height_recovery_active = 0u;
+        auto_landing_active = AUTO_LAND_STATE_INACTIVE;
+        auto_land_settle_time_s = 0.0f;
+        auto_land_wait_time_s = 0.0f;
         alt_target_vel_z_ramped = 0.0f;
         alt_target_height_ramped = vehicle_state.current_height;
         vehicle_setpoint.target_height = vehicle_state.current_height;
@@ -1317,37 +1799,100 @@ void param_update(float dT_s)
 
     if(auto_landing_request != 0u)
     {
-        uint8_t auto_land_entering = (auto_landing_active == 0u) ? 1u : 0u;
+        uint8_t auto_land_entering =
+            (auto_landing_active == AUTO_LAND_STATE_INACTIVE) ? 1u : 0u;
+        float pos_err_x_cm;
+        float pos_err_y_cm;
+        float pos_err_cm;
+        float horiz_speed_cm_s;
+        uint8_t settle_inputs_available;
 
-        auto_landing_active = 1u;
-        vehicle_state.flight_mode = FLY_AUTOLANDING;
-        vehicle_setpoint.target_height = AUTO_LAND_TARGET_HEIGHT_CM;
-
-        /* Capture the horizontal landing point once.  Rewriting it to the
-         * current EKF position every cycle silently cancels optical-flow hold
-         * during descent, precisely when a ToF-only fault still leaves the
-         * horizontal estimator healthy. */
         if(auto_land_entering != 0u)
         {
-            vehicle_setpoint.target_pos_x  = vehicle_state.current_pos_x;
-            vehicle_setpoint.target_pos_y  = vehicle_state.current_pos_y;
-            vehicle_setpoint.target_vel_x  = 0.0f;
-            vehicle_setpoint.target_vel_y  = 0.0f;
-            vehicle_setpoint.target_roll = 0.0f;
-            vehicle_setpoint.target_pitch = 0.0f;
+            auto_landing_active = AUTO_LAND_STATE_SETTLING;
+            auto_land_settle_time_s = 0.0f;
+            auto_land_wait_time_s = 0.0f;
+            auto_land_target_x_cm = vehicle_state.current_pos_x;
+            auto_land_target_y_cm = vehicle_state.current_pos_y;
+            auto_land_hold_height_cm = LIMIT(vehicle_state.current_height,
+                                             MIN_HEIGHT,
+                                             MAX_HEIGHT);
         }
+
+        vehicle_state.flight_mode = FLY_AUTOLANDING;
+
+        /* Keep one fixed landing point through both braking and descent.
+         * Following current_pos every cycle would silently cancel hold. */
+        vehicle_setpoint.target_pos_x = auto_land_target_x_cm;
+        vehicle_setpoint.target_pos_y = auto_land_target_y_cm;
+        vehicle_setpoint.target_vel_x = 0.0f;
+        vehicle_setpoint.target_vel_y = 0.0f;
+        vehicle_setpoint.target_roll = 0.0f;
+        vehicle_setpoint.target_pitch = 0.0f;
         vehicle_setpoint.target_yaw_rate = 0.0f;
 
-        /* Normal path uses ToF height/velocity.  If ToF itself caused the
-         * failsafe, the altitude state may be stale; in that case the
-         * throttle-based landed detector in alt_ctrl provides the fallback. */
-        if((alt_phase == ALT_PHASE_LANDED) ||
-           (vehicle_state.current_height <= AUTO_LAND_DISARM_HEIGHT_CM))
+        /* Only the altitude state machine may disarm after an auto-land.  It
+         * requires near-ground height, low vertical speed, low throttle and
+         * a debounce interval.  A raw height sample must never bypass those
+         * guards, especially on the same cycle as a radio-loss request. */
+        if(alt_phase == ALT_PHASE_LANDED)
         {
             vehicle_state.armed = 0u;
             auto_landing_request = 0u;
-            auto_landing_active = 0u;
+            auto_landing_active = AUTO_LAND_STATE_INACTIVE;
+            auto_land_settle_time_s = 0.0f;
+            auto_land_wait_time_s = 0.0f;
             return;
+        }
+
+        if(auto_landing_active == AUTO_LAND_STATE_SETTLING)
+        {
+            pos_err_x_cm = auto_land_target_x_cm - vehicle_state.current_pos_x;
+            pos_err_y_cm = auto_land_target_y_cm - vehicle_state.current_pos_y;
+            pos_err_cm = sqrtf(pos_err_x_cm * pos_err_x_cm +
+                               pos_err_y_cm * pos_err_y_cm);
+            horiz_speed_cm_s =
+                sqrtf(vehicle_state.current_vel_x * vehicle_state.current_vel_x +
+                      vehicle_state.current_vel_y * vehicle_state.current_vel_y);
+            auto_land_wait_time_s += dT_s;
+
+            settle_inputs_available =
+                ((flight_sensor_failsafe_flags == 0u) &&
+                 (vehicle_state.flow_valid != 0u) &&
+                 (vehicle_state.current_height > AUTO_LAND_TRIGGER_HEIGHT_CM)) ?
+                1u : 0u;
+
+            if((settle_inputs_available != 0u) &&
+               (loc_1l_ct.loc_hold_ready != 0u) &&
+               (horiz_speed_cm_s <= AUTO_LAND_SETTLE_HORIZ_SPEED_CM_S) &&
+               (pos_err_cm <= AUTO_LAND_SETTLE_POS_ERR_CM) &&
+               (fabsf(vehicle_state.current_vel_z) <= AUTO_LAND_SETTLE_VZ_CM_S))
+            {
+                auto_land_settle_time_s += dT_s;
+            }
+            else
+            {
+                auto_land_settle_time_s = 0.0f;
+            }
+
+            /* Fault landings and low-altitude requests must not hover while
+             * waiting for an estimator that cannot become ready. */
+            if((settle_inputs_available == 0u) ||
+               (auto_land_settle_time_s >= AUTO_LAND_SETTLE_STABLE_TIME_S) ||
+               (auto_land_wait_time_s >= AUTO_LAND_SETTLE_TIMEOUT_S))
+            {
+                auto_landing_active = AUTO_LAND_STATE_DESCENDING;
+            }
+        }
+
+        if(auto_landing_active == AUTO_LAND_STATE_SETTLING)
+        {
+            vehicle_setpoint.target_height = auto_land_hold_height_cm;
+            vehicle_setpoint.target_vel_z = 0.0f;
+        }
+        else
+        {
+            vehicle_setpoint.target_height = AUTO_LAND_TARGET_HEIGHT_CM;
         }
 
         vehicle_setpoint.target_height = LIMIT(vehicle_setpoint.target_height, MIN_HEIGHT, MAX_HEIGHT);
@@ -1428,10 +1973,53 @@ void param_update(float dT_s)
      * selected compile-time vision mode decides whether that means field
      * search or the isolated beacon-approach test.
      */
+    /*
+     * Once the mission has started, a cable-loaded aircraft may not be able
+     * to climb if horizontal motion is stopped at a fixed point.  Keep
+     * AUTOFLY and the current mission target, but apply a dedicated horizontal
+     * vector-speed cap until height recovers.
+     */
+    if((mission_mode_active_last != 0u) &&
+       (vehicle_state.current_height <
+        MISSION_CRUISE_DROP_PAUSE_HEIGHT_CM))
+    {
+        mission_height_recovery_active = 1u;
+        mission_height_recovery_stable_time_s = 0.0f;
+    }
+
+    if(vision_nav_obs.horizontal_fault_active != 0u)
+    {
+        mission_cruise_ready = 0u;
+        mission_cruise_stable_time_s = 0.0f;
+    }
+
+    if(mission_height_recovery_active != 0u)
+    {
+        if((vehicle_state.current_height >=
+            (LOC_TEST_TARGET_HEIGHT_CM - MISSION_CRUISE_HEIGHT_ERR_CM)) &&
+           (fabsf(vehicle_state.current_vel_z) <=
+            MISSION_CRUISE_VZ_MAX_CM_S) &&
+           (loc_1l_ct.loc_hold_ready != 0u))
+        {
+            mission_height_recovery_stable_time_s += dT_s;
+            if(mission_height_recovery_stable_time_s >=
+               MISSION_CRUISE_STABLE_TIME_S)
+            {
+                mission_height_recovery_active = 0u;
+                mission_height_recovery_stable_time_s = 0.0f;
+            }
+        }
+        else
+        {
+            mission_height_recovery_stable_time_s = 0.0f;
+        }
+    }
+
     if((vehicle_state.current_height >=
         (LOC_TEST_TARGET_HEIGHT_CM - MISSION_CRUISE_HEIGHT_ERR_CM)) &&
        (fabsf(vehicle_state.current_vel_z) <= MISSION_CRUISE_VZ_MAX_CM_S) &&
-       (loc_1l_ct.loc_hold_ready != 0u))
+       (loc_1l_ct.loc_hold_ready != 0u) &&
+       (vision_nav_obs.horizontal_fault_active == 0u))
     {
         mission_cruise_stable_time_s += dT_s;
         if(mission_cruise_stable_time_s >= MISSION_CRUISE_STABLE_TIME_S)
@@ -1444,10 +2032,51 @@ void param_update(float dT_s)
         mission_cruise_stable_time_s = 0.0f;
     }
 
-    vehicle_state.flight_mode = (mission_cruise_ready != 0u) ?
-        FLY_AUTOFLY : FLY_AUTOTAKEOFF;
-    vehicle_setpoint.target_height = LOC_TEST_TARGET_HEIGHT_CM;
-    vehicle_setpoint.target_yaw_rate = 0.0f;
+    {
+        uint8_t mission_mode_active;
+
+        /* Start directly once cruise is stable and the Y car is visible.
+         * The external competition switch is intentionally not a task gate.
+         * Once entered, a short car-vision dropout is handled by navigation
+         * hold/STOP logic rather than returning to AUTOTAKEOFF. */
+        if((mission_cruise_ready != 0u) &&
+           (vision_nav_yaw_spin_is_done() != 0u) &&
+           (vision_nav_obs.horizontal_fault_active == 0u) &&
+           (ycar_info.valid != 0u))
+        {
+            mission_task_requested = 1u;
+            mission_start_ready_latched = 1u;
+        }
+
+        mission_mode_active = (mission_start_ready_latched != 0u) ? 1u : 0u;
+
+        /* Capture a neutral hold point on the sole entry edge so neither an
+         * old takeoff goal nor a stale mission goal is carried into AUTOFLY. */
+        if(mission_mode_active != mission_mode_active_last)
+        {
+            vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
+            vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+            vehicle_setpoint.target_vel_x = 0.0f;
+            vehicle_setpoint.target_vel_y = 0.0f;
+            mission_height_recovery_active = 0u;
+            mission_height_recovery_stable_time_s = 0.0f;
+            if(mission_mode_active != 0u)
+            {
+                att_ctrl_set_yaw_target(VISION_NAV_MISSION_YAW_DEG);
+            }
+        }
+
+        vehicle_state.flight_mode = (mission_mode_active != 0u) ?
+            FLY_AUTOFLY : FLY_AUTOTAKEOFF;
+        mission_mode_active_last = mission_mode_active;
+    }
+    vehicle_setpoint.target_height =
+        (vision_nav_yaw_spin_is_done() != 0u) ?
+        LOC_TEST_TARGET_HEIGHT_CM : VISION_NAV_YAW_SPIN_HEIGHT_CM;
+    if(vision_nav_yaw_spin_is_active() == 0u)
+    {
+        vehicle_setpoint.target_yaw_rate = 0.0f;
+    }
 
     if((vehicle_state.flow_valid == 0u) ||
        (vehicle_state.current_height < LOC_ENABLE_HEIGHT_CM) ||
@@ -1656,7 +2285,15 @@ void param_update(float dT_s)
     vehicle_setpoint.target_height = LIMIT(vehicle_setpoint.target_height, MIN_HEIGHT, MAX_HEIGHT);
     vehicle_setpoint.target_roll = LIMIT(vehicle_setpoint.target_roll, -MAX_ROLL_PITCH, MAX_ROLL_PITCH);
     vehicle_setpoint.target_pitch = LIMIT(vehicle_setpoint.target_pitch, -MAX_ROLL_PITCH, MAX_ROLL_PITCH);
-    vehicle_setpoint.target_yaw_rate = LIMIT(vehicle_setpoint.target_yaw_rate, -MAX_YAW_RATE, MAX_YAW_RATE);    
+    {
+        float yaw_rate_limit =
+            (vision_nav_yaw_spin_is_active() != 0u) ?
+            VISION_NAV_YAW_SPIN_MAX_RATE_DPS : MAX_YAW_RATE;
+        vehicle_setpoint.target_yaw_rate =
+            LIMIT(vehicle_setpoint.target_yaw_rate,
+                  -yaw_rate_limit,
+                   yaw_rate_limit);
+    }
     vehicle_setpoint.target_vel_x = LIMIT(vehicle_setpoint.target_vel_x, -MAX_HORIZONTAL_SPEED, MAX_HORIZONTAL_SPEED);
     vehicle_setpoint.target_vel_y = LIMIT(vehicle_setpoint.target_vel_y, -MAX_HORIZONTAL_SPEED, MAX_HORIZONTAL_SPEED);  
     

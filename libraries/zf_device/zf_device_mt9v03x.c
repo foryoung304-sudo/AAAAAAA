@@ -57,6 +57,8 @@
 
 vuint8 mt9v03x_finish_flag = 0;                                                 // 一场图像采集完成标志位
 uint8 mt9v03x_image[MT9V03X_H][MT9V03X_W];     
+volatile uint32 mt9v03x_frame_timestamp_us = 0u;
+static mt9v03x_timestamp_source_t mt9v03x_timestamp_source = NULL;
 
 static uint8 perfect_proportion = 0;
 
@@ -74,8 +76,17 @@ void camera_finish_callback(void)
     SCB_InvalidateDCache_by_Addr(mt9v03x_image_temp[0], MT9V03X_IMAGE_SIZE);
 
     memcpy(mt9v03x_image[0], mt9v03x_image_temp[0], MT9V03X_IMAGE_SIZE);
-    
+
+    if(mt9v03x_timestamp_source != NULL)
+    {
+        mt9v03x_frame_timestamp_us = mt9v03x_timestamp_source();
+    }
     mt9v03x_finish_flag = 1;
+}
+
+void mt9v03x_set_timestamp_source(mt9v03x_timestamp_source_t source)
+{
+    mt9v03x_timestamp_source = source;
 }
 
 static void mt9v03x_trig_init(void)

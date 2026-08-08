@@ -22,6 +22,24 @@ static uint8_t vl53l8_target_is_valid(uint8_t status)
     return ((status == 5u) || (status == 6u) || (status == 9u)) ? 1u : 0u;
 }
 
+static void vl53l8_sort_distances(uint16_t *distance, uint8_t count)
+{
+    uint8_t i;
+
+    for(i = 1u; i < count; i++)
+    {
+        uint16_t value = distance[i];
+        uint8_t j = i;
+
+        while((j > 0u) && (distance[j - 1u] > value))
+        {
+            distance[j] = distance[j - 1u];
+            j--;
+        }
+        distance[j] = value;
+    }
+}
+
 static void vl53l8_decode_results(void)
 {
     uint8_t i;
@@ -56,6 +74,9 @@ static void vl53l8_decode_results(void)
     vl53l8_data.center_zone_count = center_zone_count;
     vl53l8_data.center_valid_count = 0u;
     vl53l8_data.center_trimmed = 0u;
+    vl53l8_data.ground_cluster_used = 0u;
+    vl53l8_data.ground_zone_count = 0u;
+    vl53l8_data.ground_cluster_gap_mm = 0u;
     vl53l8_data.center_raw_avg_mm = 0u;
 
     for(i = 0u; i < VL53L8_RESOLUTION; i++)
@@ -83,26 +104,12 @@ static void vl53l8_decode_results(void)
 
     if(count > 0u)
     {
-        uint16_t min_distance = valid_distance[0];
-        uint16_t max_distance = valid_distance[0];
-        uint8_t min_index = 0u;
-        uint8_t max_index = 0u;
         uint8_t raw_count = count;
         uint32_t raw_sum = 0u;
-
-        for(i = 1u; i < count; i++)
-        {
-            if(valid_distance[i] < min_distance)
-            {
-                min_distance = valid_distance[i];
-                min_index = i;
-            }
-            if(valid_distance[i] > max_distance)
-            {
-                max_distance = valid_distance[i];
-                max_index = i;
-            }
-        }
+        uint16_t largest_gap_mm = 0u;
+        uint8_t ground_start = 0u;
+        uint8_t average_start = 0u;
+        uint8_t average_end = count;
 
         for(i = 0u; i < count; i++)
         {
@@ -111,22 +118,51 @@ static void vl53l8_decode_results(void)
         vl53l8_data.center_valid_count = raw_count;
         vl53l8_data.center_raw_avg_mm = (uint16_t)(raw_sum / raw_count);
 
-        for(i = 0u; i < count; i++)
+        vl53l8_sort_distances(valid_distance, count);
+
+        /* A raised object creates a nearer range cluster followed by a clear
+         * jump to the ground.  Ignore candidate splits that leave fewer than
+         * three farther zones so one or two long-range outliers cannot win. */
+        for(i = 0u; (i + 1u) < count; i++)
         {
-            if((count >= 6u) && ((i == min_index) || (i == max_index)))
+            uint8_t farther_count = (uint8_t)(count - i - 1u);
+            uint16_t gap_mm =
+                (uint16_t)(valid_distance[i + 1u] - valid_distance[i]);
+
+            if((farther_count >= VL53L8_GROUND_CLUSTER_MIN_ZONES) &&
+               (gap_mm > largest_gap_mm))
             {
-                continue;
+                largest_gap_mm = gap_mm;
+                ground_start = (uint8_t)(i + 1u);
             }
-            sum += valid_distance[i];
         }
 
-        if(count >= 6u)
+        vl53l8_data.ground_cluster_gap_mm = largest_gap_mm;
+        if(largest_gap_mm >= VL53L8_GROUND_CLUSTER_GAP_MM)
         {
-            count -= 2u;
+            average_start = ground_start;
+            vl53l8_data.ground_cluster_used = 1u;
+        }
+        vl53l8_data.ground_zone_count =
+            (uint8_t)(average_end - average_start);
+
+        /* Preserve the old one-low/one-high trimming inside the selected
+         * cluster.  This still rejects isolated noise without mixing the car
+         * roof back into a selected ground cluster. */
+        if((average_end - average_start) >= 6u)
+        {
+            average_start++;
+            average_end--;
             vl53l8_data.center_trimmed = 1u;
         }
 
-        vl53l8_data.center_distance_mm = (uint16_t)(sum / count);
+        for(i = average_start; i < average_end; i++)
+        {
+            sum += valid_distance[i];
+        }
+
+        vl53l8_data.center_distance_mm =
+            (uint16_t)(sum / (uint8_t)(average_end - average_start));
         vl53l8_data.valid = 1u;
     }
     else

@@ -107,6 +107,20 @@ void motor_mixing_output(void)
     }
     else
     {// 四轴混控（X型）
+        if(vision_nav_yaw_spin_is_active() != 0u)
+        {
+            float base1 = throttle + pitch + roll;
+            float base2 = throttle + pitch - roll;
+            float base3 = throttle - pitch + roll;
+            float base4 = throttle - pitch - roll;
+            float base_min = MIN(MIN(base1, base2), MIN(base3, base4));
+            float base_max = MAX(MAX(base1, base2), MAX(base3, base4));
+            float yaw_headroom = MIN(base_min, MAX_CT_VAL - base_max);
+            yaw_headroom = MAX(yaw_headroom, 0.0f);
+            yaw = LIMIT(yaw, -yaw_headroom, yaw_headroom);
+            motor_mix_debug_yaw = yaw;
+        }
+
         // M1: 左前 CW, M2: 右前 CCW, M3: 左后 CCW, M4: 右后 CW
         float m1 = throttle +pitch + roll - yaw;
         float m2 = throttle + pitch - roll + yaw;

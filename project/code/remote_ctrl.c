@@ -15,12 +15,14 @@ void prase_remote_ctrl_data(float dT_s)
 
     if(!lora3a22_state_flag)
     {
-        /* A lost radio link must not cut all motors while airborne.  Let the
-         * normal auto-land state machine keep attitude and vertical control
-         * until its guarded near-ground disarm condition is reached. */
+        /* Autonomous competition flight must survive a receiver dropout.
+         * Never alter armed state here; zero only manual input and leave the
+         * active autonomous/hold controller in ownership of the aircraft. */
         if(vehicle_state.armed != 0u)
         {
+#if RADIO_LOSS_AUTOLAND_ENABLE
             auto_landing_request = 1u;
+#endif
         }
         else
         {
@@ -65,7 +67,21 @@ void prase_remote_ctrl_data(float dT_s)
     }
     else if((arm_switch_seen_locked != 0u) && (last_arm_switch == 0u))
     {
-        if(preflight_check() != 0u)
+        /* A 0->1 edge while still armed is an in-flight cancellation of a
+         * switch/radio initiated auto-land, not a new arm attempt.  Running
+         * preflight here is guaranteed to fail because the preflight Flow
+         * ready timer is intentionally zero while armed; the old failure
+         * branch then cut all motors in the air.  Sensor-failsafe landings
+         * remain latched, but even they must never clear armed here. */
+        if(vehicle_state.armed != 0u)
+        {
+            if(flight_sensor_failsafe_flags == 0u)
+            {
+                auto_landing_request = 0u;
+                auto_landing_active = 0u;
+            }
+        }
+        else if(preflight_check() != 0u)
         {
             vehicle_state.armed = 1;
             auto_landing_request = 0u;
@@ -73,11 +89,13 @@ void prase_remote_ctrl_data(float dT_s)
         }
         else
         {
+
             vehicle_state.armed = 0u;
             auto_landing_request = 0u;
             auto_landing_active = 0u;
         }
     }
+
 
     last_arm_switch = arm_switch;
     

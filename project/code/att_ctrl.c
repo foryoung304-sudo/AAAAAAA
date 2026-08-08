@@ -1,5 +1,6 @@
 #include "zf_common_headfile.h"
 #include "loc_ctrl.h"
+#include "vision_nav.h"
 
 
 
@@ -9,6 +10,7 @@ ct_val_t ct_val = {0};
 att_2l_ct_t att_2l_ct = {0};
 att_1l_ct_t att_1l_ct = {0};
 float att_voltage_output_scale = 1.0f;
+uint8_t att_takeoff_yaw_rate_hold_active = 0u;
 
 #define ATT_I_FREEZE_DUTY      3800
 #define ATT_I_FREEZE_THROTTLE  (((float)(ATT_I_FREEZE_DUTY - MOTOR_DUTY_MIN_START) / (float)(MOTOR_DUTY_MAX - MOTOR_DUTY_MIN_START)) * MAX_CT_VAL + MOTOR_OUTPUT_DEADZONE)
@@ -150,7 +152,7 @@ void att_ctrl_init(void)
     
     // 角度环PID参数（外环）- 用于自稳模式
     att_ctrl.angle_pid[0] = (pid_param_t){
-        .kp =2.5f,      // Roll Kp
+        .kp = 3.190f,    // Roll Kp
         .ki = 0.00f,     // Roll Ki
         .kd = 0.0f,      // Roll Kd
         .i_max = 10.0f,
@@ -160,7 +162,7 @@ void att_ctrl_init(void)
     };
     
     att_ctrl.angle_pid[1] = (pid_param_t){
-        .kp = 2.5f,      // Pitch Kp
+        .kp = 3.184f,    // Pitch Kp
         .ki = 0.00f,     // Pitch Ki
         .kd = 0.0f,      // Pitch Kd
         .i_max = 10.0f,
@@ -170,7 +172,7 @@ void att_ctrl_init(void)
     };
     
     att_ctrl.angle_pid[2] = (pid_param_t){
-        .kp = 0.9f,      // Yaw Kp
+        .kp = 0.872f,    // Yaw Kp
         .ki = 0.00f,     // Yaw Ki
         .kd = 0.0f,     // Yaw Kd
         .i_max = 10.0f,
@@ -182,9 +184,9 @@ void att_ctrl_init(void)
     // 角速率环PID参数（内环）- 用于精确控制
     att_ctrl.rate_pid[0] = (pid_param_t)
     {
-        .kp = 0.165f,     // Roll Rate Kp
-        .ki = 0.03f,      // Roll Rate Ki
-        .kd = 0.0005f,    // Roll Rate Kd
+        .kp = 0.1228f,    // Roll Rate Kp
+        .ki = 0.026f,     // Roll Rate Ki
+        .kd = 0.0024f,    // Roll Rate Kd
         .i_max = 50.0f,
         .p_max = 500.0f,
         .d_max = 100.0f,
@@ -192,9 +194,9 @@ void att_ctrl_init(void)
     };
     
     att_ctrl.rate_pid[1] = (pid_param_t){
-        .kp = 0.165f,     // Pitch Rate Kp
-        .ki = 0.04f,      // Pitch Rate Ki
-        .kd = 0.0005f,    // Pitch Rate Kd
+        .kp = 0.1353f,    // Pitch Rate Kp
+        .ki = 0.030f,     // Pitch Rate Ki
+        .kd = 0.0020f,    // Pitch Rate Kd
         .i_max = 50.0f,
         .p_max = 500.0f,
         .d_max = 100.0f,
@@ -202,9 +204,9 @@ void att_ctrl_init(void)
     };
     
     att_ctrl.rate_pid[2] = (pid_param_t){
-        .kp = 0.35f,      // Yaw Rate Kp
+        .kp = 0.354f,     // Yaw Rate Kp
         .ki = 0.025f,      // Yaw Rate Ki
-        .kd = 0.000f,      // Yaw Rate Kd (暂关, 防噪声放大)
+        .kd = 0.0003f,    // Yaw Rate Kd
         .i_max = 50.0f,
         .p_max = 500.0f,
         .d_max = 100.0f,
@@ -213,12 +215,29 @@ void att_ctrl_init(void)
     
 }
 
+void att_ctrl_set_yaw_target(float yaw_deg)
+{
+    while(yaw_deg < -180.0f) yaw_deg += 360.0f;
+    while(yaw_deg > 180.0f) yaw_deg -= 360.0f;
+
+    /* target_yaw_rate=0 only preserves the previously integrated heading.
+     * Mission entry needs an explicit absolute heading, matching the
+     * reference completion code's fixed FlyControl_yaw=0 behavior. */
+    att_takeoff_yaw_rate_hold_active = 0u;
+    stan_pid_reset(&att_ctrl.angle_pid[2]);
+    att_2l_ct.exp_yaw = yaw_deg;
+    att_1l_ct.set_yaw_speed = 0.0f;
+}
+
 
 
 
 // 角度环控制（外环）
 void att_2level_ctrl( float dT_s)
 {
+    float yaw_speed_limit =
+        (vision_nav_yaw_spin_is_active() != 0u) ?
+        VISION_NAV_YAW_SPIN_MAX_RATE_DPS : MAX_YAW_SPEED;
 
      // 未起飞或锁定时复位
     if(vehicle_state.armed==0)
@@ -232,6 +251,7 @@ void att_2level_ctrl( float dT_s)
         att_roll_sp_rate_ff = 0.0f;
         att_pitch_sp_rate_ff = 0.0f;
         att_sp_rate_ff_ready = 0u;
+        att_takeoff_yaw_rate_hold_active = 0u;
 
         
         // 复位PID积分项，防止地面积分饱和
@@ -290,30 +310,54 @@ void att_2level_ctrl( float dT_s)
     att_1l_ct.sp_rate_ff[0] = ATT_SP_RATE_FF_GAIN * roll_sp_rate_ff;
     att_1l_ct.sp_rate_ff[1] = ATT_SP_RATE_FF_GAIN * pitch_sp_rate_ff;
     
-    // YAW处理
-    float set_yaw_av_tmp = vehicle_setpoint.target_yaw_rate;
-    set_yaw_av_tmp = LIMIT(set_yaw_av_tmp, -MAX_YAW_SPEED, MAX_YAW_SPEED);   
-     // 平滑处理
-    att_1l_ct.set_yaw_speed += LIMIT((set_yaw_av_tmp - att_1l_ct.set_yaw_speed), -30.0f, 30.0f);
-    att_2l_ct.exp_yaw += att_1l_ct.set_yaw_speed * dT_s;
-    
-    // 限制±180度
-    if(att_2l_ct.exp_yaw < -180.0f) att_2l_ct.exp_yaw += 360.0f;
-    else if(att_2l_ct.exp_yaw > 180.0f) att_2l_ct.exp_yaw -= 360.0f;
-    
-        // 计算YAW误差
-    att_2l_ct.yaw_err = att_2l_ct.exp_yaw - att_2l_ct.fb_yaw;
-    if(att_2l_ct.yaw_err < -180.0f) att_2l_ct.yaw_err += 360.0f;
-    else if(att_2l_ct.yaw_err > 180.0f) att_2l_ct.yaw_err -= 360.0f;
-   
-    // 角度误差处理
-    if(att_2l_ct.yaw_err > 90.0f) 
+    /*
+     * A six-axis IMU has no absolute yaw reference. During the first few
+     * centimetres of takeoff, vibration-induced gyro bias can therefore
+     * accumulate into a false heading error. Chasing that error creates a
+     * large diagonal motor differential exactly when thrust matching is
+     * least repeatable. Keep only zero-rate yaw damping below the horizontal
+     * takeoff gate, then capture the current heading for a bumpless handoff.
+     */
+    if((vehicle_state.flight_mode == FLY_AUTOTAKEOFF) &&
+       (vehicle_state.current_height <
+        ATT_TAKEOFF_YAW_HEADING_ENABLE_HEIGHT_CM))
     {
-        if(set_yaw_av_tmp > 0) set_yaw_av_tmp = 0;
-    } 
-    else if(att_2l_ct.yaw_err < -90.0f) 
+        if(att_takeoff_yaw_rate_hold_active == 0u)
+        {
+            stan_pid_reset(&att_ctrl.angle_pid[2]);
+            stan_pid_reset(&att_ctrl.rate_pid[2]);
+        }
+        att_takeoff_yaw_rate_hold_active = 1u;
+        att_1l_ct.set_yaw_speed = 0.0f;
+        att_2l_ct.exp_yaw = att_2l_ct.fb_yaw;
+        att_2l_ct.yaw_err = 0.0f;
+    }
+    else
     {
-        if(set_yaw_av_tmp < 0) set_yaw_av_tmp = 0;
+        float set_yaw_av_tmp = vehicle_setpoint.target_yaw_rate;
+
+        if(att_takeoff_yaw_rate_hold_active != 0u)
+        {
+            att_2l_ct.exp_yaw = att_2l_ct.fb_yaw;
+            att_1l_ct.set_yaw_speed = 0.0f;
+            stan_pid_reset(&att_ctrl.angle_pid[2]);
+        }
+        att_takeoff_yaw_rate_hold_active = 0u;
+
+        set_yaw_av_tmp =
+            LIMIT(set_yaw_av_tmp, -yaw_speed_limit, yaw_speed_limit);
+        att_1l_ct.set_yaw_speed +=
+            LIMIT((set_yaw_av_tmp - att_1l_ct.set_yaw_speed),
+                  -30.0f,
+                   30.0f);
+        att_2l_ct.exp_yaw += att_1l_ct.set_yaw_speed * dT_s;
+
+        if(att_2l_ct.exp_yaw < -180.0f) att_2l_ct.exp_yaw += 360.0f;
+        else if(att_2l_ct.exp_yaw > 180.0f) att_2l_ct.exp_yaw -= 360.0f;
+
+        att_2l_ct.yaw_err = att_2l_ct.exp_yaw - att_2l_ct.fb_yaw;
+        if(att_2l_ct.yaw_err < -180.0f) att_2l_ct.yaw_err += 360.0f;
+        else if(att_2l_ct.yaw_err > 180.0f) att_2l_ct.yaw_err -= 360.0f;
     }
     
 
@@ -343,17 +387,33 @@ void att_2level_ctrl( float dT_s)
                        pitch_angle_error,
                        dT_s,
                        0) + att_1l_ct.sp_rate_ff[1] + pitch_large_error_boost;
-    att_1l_ct.exp_ang_vel[2] = stan_pid_solve(&att_ctrl.angle_pid[2], att_2l_ct.yaw_err, dT_s, 0);
+    if(att_takeoff_yaw_rate_hold_active != 0u)
+    {
+        att_1l_ct.exp_ang_vel[2] = 0.0f;
+    }
+    else
+    {
+        att_1l_ct.exp_ang_vel[2] =
+            stan_pid_solve(&att_ctrl.angle_pid[2],
+                           att_2l_ct.yaw_err,
+                           dT_s,
+                           0);
+    }
     
     // 限幅
     att_1l_ct.exp_ang_vel[0] = LIMIT(att_1l_ct.exp_ang_vel[0], -MAX_ROLLING_SPEED, MAX_ROLLING_SPEED);
     att_1l_ct.exp_ang_vel[1] = LIMIT(att_1l_ct.exp_ang_vel[1], -MAX_ROLLING_SPEED, MAX_ROLLING_SPEED);
-    att_1l_ct.exp_ang_vel[2] = LIMIT(att_1l_ct.exp_ang_vel[2], -MAX_YAW_SPEED, MAX_YAW_SPEED);
+    att_1l_ct.exp_ang_vel[2] = LIMIT(att_1l_ct.exp_ang_vel[2],
+                                    -yaw_speed_limit,
+                                     yaw_speed_limit);
 }
 
 // 角速率环控制（内环）
 void att_1level_ctrl(float dT_s)
 {
+    float yaw_control_limit =
+        (vision_nav_yaw_spin_is_active() != 0u) ?
+        VISION_NAV_YAW_SPIN_CT_LIMIT : MAX_YAW_CT_VAL;
     if(vehicle_state.armed==0)
     {
         ct_val.rol = 0;
@@ -381,7 +441,12 @@ void att_1level_ctrl(float dT_s)
 
     ct_val.pit = att_rate_pid_solve(&att_ctrl.rate_pid[1],att_1l_ct.exp_ang_vel[1] - att_1l_ct.fb_ang_vel[1],dT_s, enable_rate_i, MAX_ATT1_VAL);
 
-    ct_val.yaw = att_rate_pid_solve(&att_ctrl.rate_pid[2],att_1l_ct.exp_ang_vel[2] - att_1l_ct.fb_ang_vel[2],dT_s, enable_rate_i, MAX_YAW_CT_VAL);
+    ct_val.yaw = att_rate_pid_solve(&att_ctrl.rate_pid[2],
+                                    att_1l_ct.exp_ang_vel[2] -
+                                        att_1l_ct.fb_ang_vel[2],
+                                    dT_s,
+                                    enable_rate_i,
+                                    yaw_control_limit);
 
     /* Normalize actuator authority to the voltage at which the current Flash
      * PID set was validated.  Hover throttle already adapts the base thrust,
@@ -394,7 +459,9 @@ void att_1level_ctrl(float dT_s)
     // 输出限幅
     ct_val.rol =LIMIT(ct_val.rol, -MAX_ATT1_VAL, MAX_ATT1_VAL);
     ct_val.pit =  LIMIT(ct_val.pit, -MAX_ATT1_VAL, MAX_ATT1_VAL);
-    ct_val.yaw = LIMIT(ct_val.yaw, -MAX_YAW_CT_VAL, MAX_YAW_CT_VAL);
+    ct_val.yaw = LIMIT(ct_val.yaw,
+                       -yaw_control_limit,
+                        yaw_control_limit);
 }
 
 // 姿态控制主函数

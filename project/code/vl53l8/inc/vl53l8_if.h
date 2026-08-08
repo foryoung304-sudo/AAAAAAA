@@ -40,6 +40,17 @@
 #define VL53L8_RANGING_FREQ_HZ             (50u)
 #endif
 
+/* A 30 cm x 30 cm car can occupy several central zones while ground remains
+ * visible around it.  Split a nearer obstacle cluster from the farther ground
+ * cluster only when the range gap is clear and enough ground zones remain. */
+#ifndef VL53L8_GROUND_CLUSTER_GAP_MM
+#define VL53L8_GROUND_CLUSTER_GAP_MM        (100u)
+#endif
+
+#ifndef VL53L8_GROUND_CLUSTER_MIN_ZONES
+#define VL53L8_GROUND_CLUSTER_MIN_ZONES     (3u)
+#endif
+
 #define VL53L8_ZONE_COUNT                  (64u)
 
 typedef struct
@@ -53,6 +64,9 @@ typedef struct
     uint8_t center_zone_count;
     uint8_t center_valid_count;
     uint8_t center_trimmed;
+    uint8_t ground_cluster_used;
+    uint8_t ground_zone_count;
+    uint16_t ground_cluster_gap_mm;
     uint16_t center_raw_avg_mm;
     uint16_t center_distance_mm;
     int16_t distance_mm[VL53L8_ZONE_COUNT];

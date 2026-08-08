@@ -30,6 +30,8 @@ __no_init static volatile VisionAttitudeMailbox_t vision_attitude_mailbox;
 
 typedef char vision_snapshot_fits_shared_slot[
     (sizeof(VisionDetectionSnapshot_t) <= VISION_SHARED_SLOT_SIZE) ? 1 : -1];
+typedef char vision_attitude_mailbox_stays_in_reserved_window[
+    (sizeof(VisionAttitudeMailbox_t) <= 256u) ? 1 : -1];
 
 static void vision_shared_copy_to_volatile(volatile uint8_t *dst,
                                            const uint8_t *src,
@@ -70,9 +72,14 @@ void vision_shared_writer_init(void)
                                       sizeof(vision_shared_mailbox));
 }
 
-void vision_attitude_shared_publish(uint32_t timestamp_us,
+__vfp void vision_attitude_shared_publish(uint32_t timestamp_us,
                                     float roll_deg, float pitch_deg,
-                                    float yaw_deg, float height_cm)
+                                    float yaw_deg, float height_cm,
+                                    int16_t car_tx_err_forward_px,
+                                    int16_t car_tx_err_right_px,
+                                    uint8_t flight_mode,
+                                    uint8_t aircraft_armed,
+                                    const VisionFieldMapDisplay_t *field_map)
 {
     uint32_t generation = vision_attitude_mailbox.generation + 1u;
 
@@ -83,6 +90,23 @@ void vision_attitude_shared_publish(uint32_t timestamp_us,
     vision_attitude_mailbox.sample.pitch_deg = pitch_deg;
     vision_attitude_mailbox.sample.yaw_deg = yaw_deg;
     vision_attitude_mailbox.sample.height_cm = height_cm;
+    vision_attitude_mailbox.sample.car_tx_err_forward_px =
+        car_tx_err_forward_px;
+    vision_attitude_mailbox.sample.car_tx_err_right_px =
+        car_tx_err_right_px;
+    vision_attitude_mailbox.sample.flight_mode = flight_mode;
+    vision_attitude_mailbox.sample.aircraft_armed = aircraft_armed;
+    vision_attitude_mailbox.sample.reserved[0] = 0u;
+    vision_attitude_mailbox.sample.reserved[1] = 0u;
+    if(field_map != NULL)
+    {
+        vision_attitude_mailbox.sample.field_map = *field_map;
+    }
+    else
+    {
+        memset((void *)&vision_attitude_mailbox.sample.field_map, 0,
+               sizeof(vision_attitude_mailbox.sample.field_map));
+    }
     __DMB();
     vision_attitude_mailbox.generation = generation;
     SCB_CleanDCache_by_Addr((void *)&vision_attitude_mailbox,

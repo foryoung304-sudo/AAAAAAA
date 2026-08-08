@@ -136,6 +136,23 @@ static void tof_recovery_task(void)
     uint8_t ground_height_invalid;
     uint8_t recovery_required = 0u;
 
+#if ((MCAR_COMM_FIXED_TARGET_TEST_ENABLE != 0u) || \
+     (MCAR_COMM_HANDHELD_FOLLOW_TEST_ENABLE != 0u) || \
+     (MCAR_COMM_HANDHELD_BEACON_FOLLOW_TEST_ENABLE != 0u))
+    /*
+     * These disarmed communication/vision tests do not use ToF as a mission
+     * gate.  When the downward VL53L8 sees the car roof (or is hand-held
+     * above the preflight range), the normal disarmed recovery path would
+     * synchronously reload the sensor firmware.  That blocks the CM7_0 main
+     * loop for about 3.52 s and starves the independent 20 ms car heartbeat.
+     * Keep normal ranging active, but do not auto-reinitialize the sensor in
+     * a bench-test build.  Startup initialization and all formal-task builds
+     * are unchanged.
+     */
+    tof_ground_fault_since_us = 0u;
+    return;
+#endif
+
     if(vehicle_state.armed != 0u)
     {
         tof_ground_fault_since_us = 0u;
@@ -248,17 +265,17 @@ void update_current_height(float dT_s)
     // TOF 偏心安装物理补偿 
     float TOF_OFFSET_X = 8.5f;  // 1. TOF距离底板重心的前后偏移量 
     float TOF_OFFSET_Y = -0.5f; // Y轴向左，所以右侧是负数
-    // 垂直落差 
-    float TOF_OFFSET_Z = 3.2f;  
+    /* The lens is below the center of gravity.  Add its earth-vertical
+     * component so current_height remains a center-of-gravity height. */
+    float tof_to_cg_vertical_cm = TOF_TO_CG_VERTICAL_OFFSET_CM * cos_r * cos_p;
     
     // 计算因为飞机倾斜，导致 TOF 模块自身发生的真实物理升降高度
 
     float lever_arm_z = TOF_OFFSET_X * vehicle_state.pitch_sin 
-                      + TOF_OFFSET_Y * vehicle_state.roll_sin 
-                      + TOF_OFFSET_Z * (1.0f - cos_r * cos_p);
+                      + TOF_OFFSET_Y * vehicle_state.roll_sin;
     
     // 剔除偏心造成的假升降，还原出飞机真实重心的垂直高度！
-    height_cm -= lever_arm_z;
+    height_cm += tof_to_cg_vertical_cm - lever_arm_z;
     tof_health.height_cm = height_cm;
     
     static float last_height=0.0f;
@@ -369,6 +386,8 @@ void ekf_lite_predict_height(float dT_s)
 void ekf_lite_update_height(void)
 {
     static uint8_t height_ekf_z_inited = 0u;
+    static uint8_t tof_gate_recover_count = 0u;
+    static float tof_gate_recover_height_cm = 0.0f;
 
     if(vl53l8_data.data_ready==0)
     {
@@ -436,6 +455,7 @@ void ekf_lite_update_height(void)
         ekf_lite_p_z[1][0] = 0.0f;
         ekf_lite_p_z[1][1] = 25.0f;
         height_ekf_z_inited = 1u;
+        tof_gate_recover_count = 0u;
         vehicle_state.current_height = ekf_lite_state.z;
         vehicle_state.current_vel_z = ekf_lite_state.vz;
         tof_health.height_est_cm = ekf_lite_state.z;
@@ -446,6 +466,40 @@ void ekf_lite_update_height(void)
     // 新息门控 (Gate)：如果误差过大(>35cm)，说明可能是地形突变或干扰，拒绝更新
     if(fabs(innov) > EKF_LITE_TOF_GATE_CM)
     {
+        /*
+         * A valid, persistent ToF step must not leave the height estimator
+         * permanently stranded behind the innovation gate.  Require five
+         * mutually consistent measurements before re-seeding; isolated
+         * range spikes are still rejected.
+         */
+        if((tof_gate_recover_count == 0u) ||
+           (fabsf(height_cm - tof_gate_recover_height_cm) <= 10.0f))
+        {
+            tof_gate_recover_count++;
+        }
+        else
+        {
+            tof_gate_recover_count = 1u;
+        }
+        tof_gate_recover_height_cm = height_cm;
+
+        if(tof_gate_recover_count >= 5u)
+        {
+            ekf_lite_state.z = LIMIT(height_cm, MIN_HEIGHT, MAX_HEIGHT);
+            ekf_lite_state.vz = 0.0f;
+            ekf_lite_p_z[0][0] = 25.0f;
+            ekf_lite_p_z[0][1] = 0.0f;
+            ekf_lite_p_z[1][0] = 0.0f;
+            ekf_lite_p_z[1][1] = 25.0f;
+            tof_gate_recover_count = 0u;
+            vehicle_state.current_height = ekf_lite_state.z;
+            vehicle_state.current_vel_z = ekf_lite_state.vz;
+            tof_health.height_est_cm = ekf_lite_state.z;
+            tof_health.vel_z_cm_s = ekf_lite_state.vz;
+            tof_health.ekf_used = 1u;
+            return;
+        }
+
         ekf_lite_state.vz = 0.0f;
         vehicle_state.current_height = ekf_lite_state.z;
         vehicle_state.current_vel_z = ekf_lite_state.vz;
@@ -454,6 +508,8 @@ void ekf_lite_update_height(void)
         tof_health.vel_z_cm_s = ekf_lite_state.vz;
         return;
     }
+
+    tof_gate_recover_count = 0u;
 
     // 计算新息协方差 S = H * P * H^T + R
     s = ekf_lite_p_z[0][0] + r_tof;

@@ -46,6 +46,10 @@
 #define DEBUG_UART_TX_PIN           (UART2_TX_P10_1 )                           // ָ debug uart ʹõĵĴ
 #define DEBUG_UART_RX_PIN           (UART2_RX_P10_0)                            // ָ debug uart ʹõĵĴ
 
+/*#define DEBUG_UART_INDEX            (UART_0)                                    // ָ debug uart ʹõĵĴ
+#define DEBUG_UART_BAUDRATE         (115200)                                    // ָ debug uart ʹõĵĴڲ
+#define DEBUG_UART_TX_PIN           (UART0_TX_P00_1 )                           // ָ debug uart ʹõĵĴ
+#define DEBUG_UART_RX_PIN           (UART0_RX_P00_0)                            // ָ debug uart ʹõĵĴ*/
 #define DEBUG_UART_USE_INTERRUPT    (1)                                         //Ƿ debug uartж
 
 //-------------------------------------------------------------------------------------------------------------------

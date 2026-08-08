@@ -119,6 +119,8 @@
 #include "flow.h"
 #include "system.h"
 #include "small_driver_uart_control.h"
+#include "mcar_comm.h"
+#include "mcar_guidance.h"
 
 #include "ctrl_common.h"
 #include "att_ctrl.h"

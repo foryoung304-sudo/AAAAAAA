@@ -51,6 +51,14 @@ static uint8_t alt_landed_raw(void)
         return 0u;
     }
 
+    /* During commanded auto-landing the height loop may still hold roughly
+     * hover throttle after touchdown.  Height and vertical-speed debounce are
+     * sufficient here; requiring low throttle can prevent disarming forever. */
+    if(vehicle_state.flight_mode == FLY_AUTOLANDING)
+    {
+        return 1u;
+    }
+
     return (throttle_ramped_debug <
             (system_get_hover_throttle_base() - ALT_LANDED_THR_MARGIN)) ? 1u : 0u;
 }
@@ -222,7 +230,7 @@ void alt_ctrl_init(void)
 {
     alt_ctrl.height_pid = (pid_param_t)
     {
-        .kp = 0.04f,
+        .kp = 0.06f,
         .ki = 0.0f,
         .kd = 0.0f,
         .i_max = 50.0f,
@@ -233,8 +241,8 @@ void alt_ctrl_init(void)
     
     alt_ctrl.vel_pid = (pid_param_t)
     {
-        .kp = 0.15f,
-        .ki = 0.05f,
+        .kp = 0.135f,
+        .ki = 0.100f,
         .kd = 0.0f,
         .i_max = 3.0f,
         .p_max = 100.0f,
@@ -508,6 +516,7 @@ void alt_2level_ctrl(float dT_s)
                                      ALT_TRAJ_MAX_CLIMB_CM_S);
 
             if((vehicle_state.flight_mode == FLY_AUTOLANDING) &&
+               (auto_landing_active >= AUTO_LAND_STATE_DESCENDING) &&
                (vehicle_state.current_height > AUTO_LAND_MIN_DESCEND_HEIGHT_CM))
             {
                 velocity_command = MIN(velocity_command,

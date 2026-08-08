@@ -36,7 +36,7 @@ typedef struct {
 
 
 extern BeaconInfo beacon;
-#define IR_THRESHOLD 200
+#define IR_THRESHOLD 225
 #define MAX_CENTERS 6
 #define MAX_BLOB 10
 #define BEACON_AREA_MIN 4
@@ -44,7 +44,7 @@ extern BeaconInfo beacon;
 #define BEACON_EMA_ALPHA 0.9f
 #define BEACON_LOST_HOLD 3
 #define BEACON_LOST_SEARCH 5
-#define CAR_IR_THRESHOLD 120
+#define CAR_IR_THRESHOLD 145
 #define CAR_BLOB_MIN_AREA 8
 #define CAR_BLOB_MERGE_GAP 6
 #define CAR_MIN_PIX 30

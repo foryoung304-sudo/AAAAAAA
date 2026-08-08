@@ -1,5 +1,7 @@
 #include "mcar_guidance.h"
 
+mcar_guidance_diag_t mcar_guidance_diag = {0};
+
 static int16 mcar_guidance_round_to_i16(float value)
 {
     if(value > 32767.0f) return 32767;
@@ -23,6 +25,7 @@ mcar_guidance_t mcar_guidance_calculate(float beacon_body_x,
                                         float drone_yaw_earth_deg)
 {
     mcar_guidance_t result = {0};
+    mcar_guidance_diag.valid = 0u;
     float head_norm = sqrtf(mcar_head_body_x * mcar_head_body_x
                           + mcar_head_body_y * mcar_head_body_y);
 
@@ -31,18 +34,37 @@ mcar_guidance_t mcar_guidance_calculate(float beacon_body_x,
         return result;
     }
 
-    float head_x = mcar_head_body_x / head_norm;
-    float head_y = mcar_head_body_y / head_norm;
+    /*
+     * The vision marker direction points from the physical nose toward the
+     * tail. Convert it to the car-control convention: positive X is forward.
+     */
+    float head_x = -mcar_head_body_x / head_norm;
+    float head_y = -mcar_head_body_y / head_norm;
+    /* Keep the field-validated forward/right command convention above, but
+     * report yaw from the visual nose vector itself.  Using the negated
+     * command basis for atan2 adds an unwanted constant 180-degree offset. */
+    float yaw_head_x = mcar_head_body_x / head_norm;
+    float yaw_head_y = mcar_head_body_y / head_norm;
     float rel_x = beacon_body_x - mcar_body_x;
     float rel_y = beacon_body_y - mcar_body_y;
     float err_forward = rel_x * head_x + rel_y * head_y;
     float err_right = -rel_x * head_y + rel_y * head_x;
-    float mcar_yaw_body_deg = atan2f(head_y, head_x) * 57.2957795f;
+    float mcar_yaw_body_deg = atan2f(yaw_head_y, yaw_head_x) * 57.2957795f;
     float mcar_yaw_earth_deg = mcar_guidance_wrap_180(drone_yaw_earth_deg
                                                     + mcar_yaw_body_deg);
 
-    result.err_forward_px = mcar_guidance_round_to_i16(err_forward);
-    result.err_right_px = mcar_guidance_round_to_i16(err_right);
+    mcar_guidance_diag.mcar_yaw_body_deg = mcar_yaw_body_deg;
+    mcar_guidance_diag.mcar_yaw_earth_deg = mcar_yaw_earth_deg;
+    mcar_guidance_diag.valid = 1u;
+
+    /*
+     * Field validation: the aircraft-side command convention is 180 degrees
+     * opposite to the Y-car's forward/right actuator convention.  Apply the
+     * correction at the final aircraft->car command seam, after projection;
+     * do not change vision geometry, protocol encoding, or car firmware.
+     */
+    result.err_forward_px = mcar_guidance_round_to_i16(-err_forward);
+    result.err_right_px = mcar_guidance_round_to_i16(-err_right);
     result.mcar_yaw_earth_cdeg = mcar_guidance_round_to_i16(mcar_yaw_earth_deg * 100.0f);
     result.valid = 1u;
     return result;

@@ -51,6 +51,10 @@ static uint32_t vision_attitude_time_error_us = 0u;
 #define VISION_SHARED_ATTITUDE_MAX_AGE_US 50000u
 static VisionBeaconCandidate_t vision_beacon_candidates[VISION_MAX_BEACON_CANDIDATES];
 static uint8_t vision_beacon_candidate_count = 0u;
+static uint8_t mission_center_only_frames = 0u;
+static uint8_t mission_selected_candidate_valid = 0u;
+static int16_t mission_selected_candidate_x = 0;
+static int16_t mission_selected_candidate_y = 0;
 
 static void beacon_calibration_log(void)
 {
@@ -243,6 +247,152 @@ static void beacon_update_metric_position_with_height(float height_cm)
     beacon_camera_y_cm = beacon_body_y * height_cm * BEACON_SCALE_Y;
     beacon_drone_x_cm = beacon_camera_x_cm + CAMERA_OFFSET_BODY_X_CM;
     beacon_drone_y_cm = beacon_camera_y_cm + CAMERA_OFFSET_BODY_Y_CM;
+}
+
+static void mission_candidate_reset(void)
+{
+    mission_center_only_frames = 0u;
+    mission_selected_candidate_valid = 0u;
+    mission_selected_candidate_x = 0;
+    mission_selected_candidate_y = 0;
+}
+
+static void mission_candidate_missed(void)
+{
+    mission_center_only_frames = 0u;
+    if(vision_nav_target_active() == 0u)
+    {
+        mission_selected_candidate_valid = 0u;
+    }
+}
+
+static uint8_t mission_select_beacon_candidate(
+    const VisionDetectionSnapshot_t *snapshot,
+    float frame_roll, float frame_pitch, float frame_height,
+    int16_t *selected_x, int16_t *selected_y, uint16_t *selected_area)
+{
+    uint8_t center_candidate[VISION_MAX_BEACON_CANDIDATES] = {0u};
+    uint8_t center_count = 0u;
+    uint8_t outer_count = 0u;
+    uint8_t selected = 0xFFu;
+    uint8_t target_active = vision_nav_target_active();
+    uint8_t locked_center = vision_nav_locked_target_is_center();
+    uint8_t allow_center = 0u;
+    int32_t best_distance_sq = 0x7FFFFFFF;
+
+    if((snapshot == NULL) || (selected_x == NULL) ||
+       (selected_y == NULL) || (selected_area == NULL) ||
+       (snapshot->beacon_candidate_count == 0u))
+    {
+        mission_candidate_missed();
+        return 0u;
+    }
+
+    if(vision_nav_beacon_selection_blocked() != 0u)
+    {
+        mission_candidate_reset();
+        return 0u;
+    }
+
+    for(uint8_t i = 0u; i < snapshot->beacon_candidate_count; i++)
+    {
+        float corrected_x;
+        float corrected_y;
+        float body_x_px;
+        float body_y_px;
+        float body_x_cm;
+        float body_y_cm;
+
+        vision_attitude_compensation_with_attitude(
+            (float)snapshot->beacon_candidates[i].x,
+            (float)snapshot->beacon_candidates[i].y,
+            frame_roll, frame_pitch, &corrected_x, &corrected_y);
+        image_point_to_body_offset(corrected_x, corrected_y,
+                                   &body_x_px, &body_y_px);
+        body_x_cm = body_x_px * frame_height * BEACON_SCALE_X +
+                    CAMERA_OFFSET_BODY_X_CM;
+        body_y_cm = body_y_px * frame_height * BEACON_SCALE_Y +
+                    CAMERA_OFFSET_BODY_Y_CM;
+        center_candidate[i] = vision_nav_beacon_is_center_reference(
+            body_x_cm, body_y_cm);
+        if(center_candidate[i] != 0u) center_count++;
+        else outer_count++;
+    }
+
+    if(target_active != 0u)
+    {
+        allow_center = locked_center;
+        mission_center_only_frames = 0u;
+    }
+    else if(vision_nav_obs.search_center_settled == 0u)
+    {
+        /* A centre-looking lamp seen on the way in may be the only part of a
+         * multi-lamp layout currently inside the camera view. Survey it from
+         * the field centre before allowing the car to extinguish it. */
+        allow_center = 0u;
+        mission_center_only_frames = 0u;
+    }
+    else if((center_count != 0u) && (outer_count == 0u))
+    {
+        if(mission_center_only_frames < 255u)
+        {
+            mission_center_only_frames++;
+        }
+        allow_center = (mission_center_only_frames >=
+                        VISION_NAV_CENTER_ONLY_CONFIRM_FRAMES) ? 1u : 0u;
+    }
+    else
+    {
+        /* Multiple lamps: keep the centre lamp as the return/search anchor
+         * and select an outer lamp. */
+        allow_center = 0u;
+        mission_center_only_frames = 0u;
+    }
+
+    for(uint8_t i = 0u; i < snapshot->beacon_candidate_count; i++)
+    {
+        int32_t dx;
+        int32_t dy;
+        int32_t distance_sq;
+
+        if((center_candidate[i] != 0u) != (allow_center != 0u)) continue;
+
+        if((target_active == 0u) ||
+           (mission_selected_candidate_valid == 0u))
+        {
+            selected = i;
+            break;
+        }
+
+        dx = snapshot->beacon_candidates[i].x -
+             mission_selected_candidate_x;
+        dy = snapshot->beacon_candidates[i].y -
+             mission_selected_candidate_y;
+        distance_sq = dx * dx + dy * dy;
+        if(distance_sq < best_distance_sq)
+        {
+            best_distance_sq = distance_sq;
+            selected = i;
+        }
+    }
+
+    if((selected == 0xFFu) ||
+       ((target_active != 0u) &&
+        (mission_selected_candidate_valid != 0u) &&
+        (best_distance_sq >
+         VISION_NAV_LOCKED_CANDIDATE_RADIUS_PX *
+         VISION_NAV_LOCKED_CANDIDATE_RADIUS_PX)))
+    {
+        return 0u;
+    }
+
+    *selected_x = snapshot->beacon_candidates[selected].x;
+    *selected_y = snapshot->beacon_candidates[selected].y;
+    *selected_area = snapshot->beacon_candidates[selected].area;
+    mission_selected_candidate_x = *selected_x;
+    mission_selected_candidate_y = *selected_y;
+    mission_selected_candidate_valid = 1u;
+    return 1u;
 }
 
 static void image_vector_to_body_vector(float img_x, float img_y,
@@ -1615,7 +1765,8 @@ uint8_t image_process()
     vision_test_log();
     beacon_calibration_log();
 
-    vision_nav_update();
+    /* Vision navigation is run by param_update() at the 20 ms control
+     * boundary.  This frame task must only publish observations. */
 
     mcar_guidance.valid = 0u;
     if(YCAR_GUIDANCE_ENABLE && ycar_info.valid)
@@ -1626,7 +1777,7 @@ uint8_t image_process()
                 0.0f, 0.0f, ycar_body_x, ycar_body_y,
                 ycar_head_body_x, ycar_head_body_y, imu_data.yaw);
         }
-        else if(beacon.status == BEACON_FOUND)
+        else if(vision_nav_beacon_command_valid() != 0u)
         {
             mcar_guidance = mcar_guidance_calculate(
                 beacon_body_x, beacon_body_y, ycar_body_x, ycar_body_y,
@@ -1634,7 +1785,33 @@ uint8_t image_process()
         }
     }
 
-#if MCAR_COMM_FIXED_TARGET_TEST_ENABLE
+#if MCAR_COMM_HANDHELD_BEACON_FOLLOW_TEST_ENABLE
+    mcar_guidance.valid = 0u;
+    if((beacon.status == BEACON_FOUND) &&
+       (debug_beacon_lost == 0u) &&
+       (ycar_info.valid != 0u) &&
+       (debug_ycar_lost == 0u))
+    {
+        mcar_guidance = mcar_guidance_calculate(
+            beacon_body_x, beacon_body_y, ycar_body_x, ycar_body_y,
+            ycar_head_body_x, ycar_head_body_y, imu_data.yaw);
+    }
+    if(mcar_guidance.valid != 0u)
+    {
+        uint8 flags = MCAR_COMM_FLAG_BEACON_VALID |
+                      MCAR_COMM_FLAG_MCAR_VALID |
+                      MCAR_COMM_FLAG_TARGET_ACTIVE;
+        mcar_comm_send_target(vision_nav_target_seq(),
+                              mcar_guidance.err_forward_px,
+                              mcar_guidance.err_right_px,
+                              0,
+                              flags);
+    }
+    else
+    {
+        mcar_comm_send_stop(vision_nav_target_seq());
+    }
+#elif MCAR_COMM_FIXED_TARGET_TEST_ENABLE
     {
         uint8 flags = MCAR_COMM_FLAG_BEACON_VALID |
                       MCAR_COMM_FLAG_MCAR_VALID |
@@ -1646,18 +1823,25 @@ uint8_t image_process()
     if(mcar_guidance.valid &&
        (vision_nav_target_active() ||
         vision_nav_obs.search_move_active != 0u) &&
-       vehicle_state.flight_mode == FLY_AUTOFLY &&
-       loc_1l_ct.loc_hold_ready != 0u)
+       (vehicle_state.flight_mode == FLY_AUTOFLY) &&
+       loc_1l_ct.loc_hold_ready != 0u &&
+       (vision_nav_flight_ready() != 0u))
     {
+        uint8 search_active =
+            (vision_nav_obs.search_move_active != 0u) ? 1u : 0u;
         uint8 flags = MCAR_COMM_FLAG_MCAR_VALID |
-                      MCAR_COMM_FLAG_YAW_VALID |
                       MCAR_COMM_FLAG_TARGET_ACTIVE;
+        if(search_active == 0u)
+        {
+            flags |= MCAR_COMM_FLAG_YAW_VALID;
+        }
         /*
          * Existing car firmware treats BEACON_VALID as a generic guidance
-         * target-valid gate.  During center return the synthetic target is
-         * the camera center, so keep that compatibility bit asserted.
+         * target-valid gate.  During center return and lane scanning the
+         * synthetic target is the camera center, so keep that compatibility
+         * bit asserted and make the Y-car follow the aircraft continuously.
          */
-        if((beacon.status == BEACON_FOUND) ||
+        if((vision_nav_beacon_command_valid() != 0u) ||
            (vision_nav_obs.search_move_active != 0u))
         {
             flags |= MCAR_COMM_FLAG_BEACON_VALID;
@@ -1666,17 +1850,24 @@ uint8_t image_process()
         {
             flags |= MCAR_COMM_FLAG_OBS_HELD;
         }
+        if(mission_height_recovery_active != 0u)
+        {
+            /* Keep the car moving with the tethered aircraft, but ask the
+             * car firmware to use its reduced recovery speed limit. */
+            flags |= MCAR_COMM_FLAG_RECOVERY_SLOW;
+        }
 
         mcar_comm_send_target(vision_nav_target_seq(),
                               mcar_guidance.err_forward_px,
                               mcar_guidance.err_right_px,
-                              mcar_guidance.mcar_yaw_earth_cdeg,
+                              (search_active != 0u) ? 0 :
+                                  mcar_guidance.mcar_yaw_earth_cdeg,
                               flags);
     }
     else
     {
         uint8 flags = MCAR_COMM_FLAG_STOP;
-        if(beacon.status == BEACON_FOUND) flags |= MCAR_COMM_FLAG_BEACON_VALID;
+        if(vision_nav_beacon_command_valid() != 0u) flags |= MCAR_COMM_FLAG_BEACON_VALID;
         if(ycar_info.valid) flags |= MCAR_COMM_FLAG_MCAR_VALID;
         mcar_comm_send_target(vision_nav_target_seq(), 0, 0, 0, flags);
     }
@@ -1691,12 +1882,47 @@ uint8_t vision_consumer_update(void)
     static uint32_t last_frame_id = 0u;
     static uint32_t last_frame_rx_us = 0u;
     static uint8_t stale_reported = 0u;
+#if MCAR_COMM_HANDHELD_BEACON_FOLLOW_TEST_ENABLE || \
+    MCAR_COMM_HANDHELD_FOLLOW_TEST_ENABLE
+    static mcar_guidance_t handheld_guidance = {0};
+    static uint32_t handheld_last_tx_us = 0u;
+    static uint32_t handheld_beacon_last_seen_us = 0u;
+    static uint8_t handheld_obs_held = 0u;
+    static uint32_t debug_last_us = 0u;
+    static uint32_t debug_last_frame_id = 0u;
+    static uint32_t debug_last_tx_count = 0u;
+    static uint32_t debug_last_rx_byte_count = 0u;
+    static uint32_t debug_last_rx_bad_count = 0u;
+    static uint32_t debug_last_call_us = 0u;
+    static uint32_t debug_call_gap_max_us = 0u;
+    static uint32_t debug_poll_max_us = 0u;
+    static uint32_t debug_send_max_us = 0u;
+#endif
     VisionDetectionSnapshot_t snapshot;
     mcar_guidance_t guidance = {0};
     uint32_t now_us = system_time_us();
     uint8_t have_new_frame = 0u;
 
+#if MCAR_COMM_HANDHELD_BEACON_FOLLOW_TEST_ENABLE || \
+    MCAR_COMM_HANDHELD_FOLLOW_TEST_ENABLE
+    if(debug_last_call_us != 0u)
+    {
+        uint32_t call_gap_us = now_us - debug_last_call_us;
+        if(call_gap_us > debug_call_gap_max_us)
+        {
+            debug_call_gap_max_us = call_gap_us;
+        }
+    }
+    debug_last_call_us = now_us;
+    {
+        uint32_t poll_start_us = system_time_us();
+        mcar_comm_poll();
+        uint32_t poll_us = system_time_us() - poll_start_us;
+        if(poll_us > debug_poll_max_us) debug_poll_max_us = poll_us;
+    }
+#else
     mcar_comm_poll();
+#endif
     if(vision_shared_read(&snapshot) && snapshot.frame_id != last_frame_id)
     {
         float frame_roll = snapshot.frame_roll_deg;
@@ -1723,27 +1949,55 @@ uint8_t vision_consumer_update(void)
         debug_beacon_second_x = snapshot.beacon_second_x;
         debug_beacon_second_y = snapshot.beacon_second_y;
 
-        if(snapshot.beacon_valid && vision_attitude_sync_ok)
         {
-            beacon.status = BEACON_FOUND;
-            beacon.centerX = snapshot.beacon_x;
-            beacon.centerY = snapshot.beacon_y;
-            beacon.area = (snapshot.beacon_candidate_count > 0u) ?
-                          snapshot.beacon_candidates[0].area : 0u;
-            beacon_lost_cnt = 0u;
-            debug_beacon_lost = 0u;
-            vision_attitude_compensation_with_attitude(
-                (float)beacon.centerX, (float)beacon.centerY,
-                frame_roll, frame_pitch, &beacon_corr_x, &beacon_corr_y);
-            image_point_to_body_offset(beacon_corr_x, beacon_corr_y,
-                                       &beacon_body_x, &beacon_body_y);
-            beacon_update_metric_position_with_height(frame_height);
-        }
-        else
-        {
-            beacon.status = BEACON_NOT_FOUND;
-            if(beacon_lost_cnt < 255u) beacon_lost_cnt++;
-            debug_beacon_lost = beacon_lost_cnt;
+            uint8_t selected_beacon_valid = 0u;
+            int16_t selected_beacon_x = snapshot.beacon_x;
+            int16_t selected_beacon_y = snapshot.beacon_y;
+            uint16_t selected_beacon_area =
+                (snapshot.beacon_candidate_count > 0u) ?
+                snapshot.beacon_candidates[0].area : 0u;
+
+            if(snapshot.beacon_valid && vision_attitude_sync_ok)
+            {
+                if(vision_nav_center_beacon_policy_active() != 0u)
+                {
+                    selected_beacon_valid = mission_select_beacon_candidate(
+                        &snapshot, frame_roll, frame_pitch, frame_height,
+                        &selected_beacon_x, &selected_beacon_y,
+                        &selected_beacon_area);
+                }
+                else
+                {
+                    mission_candidate_reset();
+                    selected_beacon_valid = 1u;
+                }
+            }
+            else
+            {
+                mission_candidate_missed();
+            }
+
+            if(selected_beacon_valid != 0u)
+            {
+                beacon.status = BEACON_FOUND;
+                beacon.centerX = selected_beacon_x;
+                beacon.centerY = selected_beacon_y;
+                beacon.area = selected_beacon_area;
+                beacon_lost_cnt = 0u;
+                debug_beacon_lost = 0u;
+                vision_attitude_compensation_with_attitude(
+                    (float)beacon.centerX, (float)beacon.centerY,
+                    frame_roll, frame_pitch, &beacon_corr_x, &beacon_corr_y);
+                image_point_to_body_offset(beacon_corr_x, beacon_corr_y,
+                                           &beacon_body_x, &beacon_body_y);
+                beacon_update_metric_position_with_height(frame_height);
+            }
+            else
+            {
+                beacon.status = BEACON_NOT_FOUND;
+                if(beacon_lost_cnt < 255u) beacon_lost_cnt++;
+                debug_beacon_lost = beacon_lost_cnt;
+            }
         }
 
         if(snapshot.ycar_valid && vision_attitude_sync_ok)
@@ -1781,7 +2035,7 @@ uint8_t vision_consumer_update(void)
 
         //vision_test_log();
         //beacon_calibration_log();
-        vision_nav_update();
+        /* Setpoint ownership stays in the 20 ms control task. */
 
         if(YCAR_GUIDANCE_ENABLE && ycar_info.valid)
         {
@@ -1791,7 +2045,7 @@ uint8_t vision_consumer_update(void)
                     0.0f, 0.0f, ycar_body_x, ycar_body_y,
                     ycar_head_body_x, ycar_head_body_y, frame_yaw);
             }
-            else if(beacon.status == BEACON_FOUND)
+            else if(vision_nav_beacon_command_valid() != 0u)
             {
                 guidance = mcar_guidance_calculate(
                     beacon_body_x, beacon_body_y, ycar_body_x, ycar_body_y,
@@ -1799,53 +2053,225 @@ uint8_t vision_consumer_update(void)
             }
         }
 
-#if MCAR_COMM_FIXED_TARGET_TEST_ENABLE
+#if MCAR_COMM_HANDHELD_BEACON_FOLLOW_TEST_ENABLE
+        /* Handheld beacon-recognition test: bypass arming, flight mode,
+         * height, LOC and mission gates.  Fresh Y-car and beacon observations
+         * from the same processing stream normally update the command.  If a
+         * previously confirmed beacon disappears only after entering the
+         * Y-car's near-contact radius, keep its locked position for the same
+         * bounded 200 ms cover grace used by the formal mission.  A fused
+         * saturated lamp/tail blob has no honest two-object segmentation;
+         * this lets the car finish the last few centimetres without allowing
+         * a distant or prolonged dropout to continue motion. */
+        guidance.valid = 0u;
+        handheld_obs_held = 0u;
+        if((beacon.status == BEACON_FOUND) &&
+           (debug_beacon_lost == 0u) &&
+           (ycar_info.valid != 0u) &&
+           (debug_ycar_lost == 0u))
+        {
+            guidance = mcar_guidance_calculate(
+                beacon_body_x, beacon_body_y, ycar_body_x, ycar_body_y,
+                ycar_head_body_x, ycar_head_body_y, frame_yaw);
+            handheld_beacon_last_seen_us = now_us;
+        }
+        else if((handheld_beacon_last_seen_us != 0u) &&
+                ((now_us - handheld_beacon_last_seen_us) <=
+                 MCAR_COMM_HANDHELD_BEACON_OVERLAP_HOLD_US) &&
+                (ycar_info.valid != 0u) &&
+                (debug_ycar_lost == 0u) &&
+                (handheld_guidance.valid != 0u))
+        {
+            int32_t overlap_dx = (int32_t)beacon.centerX - ycar_info.cx;
+            int32_t overlap_dy = (int32_t)beacon.centerY - ycar_info.cy;
+            int32_t overlap_radius =
+                MCAR_COMM_HANDHELD_BEACON_OVERLAP_RADIUS_PX;
+
+            if((overlap_dx * overlap_dx + overlap_dy * overlap_dy) <=
+               (overlap_radius * overlap_radius))
+            {
+                guidance = mcar_guidance_calculate(
+                    beacon_body_x, beacon_body_y,
+                    ycar_body_x, ycar_body_y,
+                    ycar_head_body_x, ycar_head_body_y, frame_yaw);
+                handheld_obs_held = (guidance.valid != 0u) ? 1u : 0u;
+            }
+        }
+
+        handheld_guidance = guidance;
+#elif MCAR_COMM_HANDHELD_FOLLOW_TEST_ENABLE
+        /* Handheld communication test: intentionally bypass flight mode,
+         * height, LOC, mission and arming gates.  Camera center is the
+         * synthetic target, so the car follows the aircraft being carried.
+         * Require a fresh observation; the first missed frame sends STOP. */
+        guidance.valid = 0u;
+        handheld_obs_held = 0u;
+        if((ycar_info.valid != 0u) && (debug_ycar_lost == 0u))
+        {
+            guidance = mcar_guidance_calculate(
+                0.0f, 0.0f, ycar_body_x, ycar_body_y,
+                ycar_head_body_x, ycar_head_body_y, frame_yaw);
+        }
+
+        handheld_guidance = guidance;
+#elif MCAR_COMM_FIXED_TARGET_TEST_ENABLE
         {
             uint8 flags = MCAR_COMM_FLAG_BEACON_VALID |
                           MCAR_COMM_FLAG_MCAR_VALID |
                           MCAR_COMM_FLAG_YAW_VALID |
                           MCAR_COMM_FLAG_TARGET_ACTIVE;
-            mcar_comm_send_target(vision_nav_target_seq(), 50, 0, 0, flags);
+            mcar_comm_send_target(vision_nav_target_seq(), 20, 10, 9000, flags);
         }
 #else
         if(guidance.valid &&
            (vision_nav_target_active() ||
             vision_nav_obs.search_move_active != 0u) &&
-           vehicle_state.flight_mode == FLY_AUTOFLY &&
-           loc_1l_ct.loc_hold_ready != 0u)
+           (vehicle_state.flight_mode == FLY_AUTOFLY) &&
+           loc_1l_ct.loc_hold_ready != 0u &&
+           (vision_nav_flight_ready() != 0u))
         {
+            uint8 search_active =
+                (vision_nav_obs.search_move_active != 0u) ? 1u : 0u;
             uint8 flags = MCAR_COMM_FLAG_MCAR_VALID |
-                          MCAR_COMM_FLAG_YAW_VALID |
                           MCAR_COMM_FLAG_TARGET_ACTIVE;
-            /* Camera center is the valid guidance target while returning. */
-            if((beacon.status == BEACON_FOUND) ||
+            if(search_active == 0u)
+            {
+                flags |= MCAR_COMM_FLAG_YAW_VALID;
+            }
+            /* Camera center remains the valid guidance target throughout
+             * center return and the continuous lane scan. */
+            if((vision_nav_beacon_command_valid() != 0u) ||
                (vision_nav_obs.search_move_active != 0u))
             {
                 flags |= MCAR_COMM_FLAG_BEACON_VALID;
             }
+            if(vision_nav_beacon_command_held() != 0u ||
+               debug_ycar_lost != 0u)
+            {
+                flags |= MCAR_COMM_FLAG_OBS_HELD;
+            }
+            if(mission_height_recovery_active != 0u)
+            {
+                flags |= MCAR_COMM_FLAG_RECOVERY_SLOW;
+            }
             mcar_comm_send_target(vision_nav_target_seq(),
                                   guidance.err_forward_px,
                                   guidance.err_right_px,
-                                  guidance.mcar_yaw_earth_cdeg, flags);
+                                  (search_active != 0u) ? 0 :
+                                      guidance.mcar_yaw_earth_cdeg,
+                                  flags);
         }
         else
         {
             uint8 flags = MCAR_COMM_FLAG_STOP;
-            if(beacon.status == BEACON_FOUND) flags |= MCAR_COMM_FLAG_BEACON_VALID;
+            if(vision_nav_beacon_command_valid() != 0u) flags |= MCAR_COMM_FLAG_BEACON_VALID;
             if(ycar_info.valid) flags |= MCAR_COMM_FLAG_MCAR_VALID;
             mcar_comm_send_target(vision_nav_target_seq(), 0, 0, 0, flags);
         }
 #endif
     }
+#if !(MCAR_COMM_HANDHELD_BEACON_FOLLOW_TEST_ENABLE || \
+      MCAR_COMM_HANDHELD_FOLLOW_TEST_ENABLE)
     else if(last_frame_rx_us != 0u &&
             now_us - last_frame_rx_us > 120000u && !stale_reported)
     {
         stale_reported = 1u;
         beacon.status = BEACON_NOT_FOUND;
         ycar_info.valid = 0u;
-        vision_nav_update();
+        /* The control task consumes the stale snapshot and owns setpoints. */
         mcar_comm_send_stop(vision_nav_target_seq());
     }
+#endif
+
+#if MCAR_COMM_HANDHELD_BEACON_FOLLOW_TEST_ENABLE || \
+    MCAR_COMM_HANDHELD_FOLLOW_TEST_ENABLE
+    /* Keep the protocol heartbeat independent of the CM7_1 vision cadence.
+     * Fresh observations update the cached command above; a stale or invalid
+     * observation is represented by a repeated STOP, which the car also
+     * counts as a valid communication frame. */
+    if((handheld_last_tx_us == 0u) ||
+       ((now_us - handheld_last_tx_us) >= 20000u))
+    {
+        uint32_t send_start_us = system_time_us();
+        if((handheld_guidance.valid != 0u) &&
+           (last_frame_rx_us != 0u) &&
+           ((now_us - last_frame_rx_us) <= 120000u))
+        {
+            uint8 flags = MCAR_COMM_FLAG_BEACON_VALID |
+                          MCAR_COMM_FLAG_MCAR_VALID |
+                          MCAR_COMM_FLAG_TARGET_ACTIVE;
+            if(handheld_obs_held != 0u)
+            {
+                flags |= MCAR_COMM_FLAG_OBS_HELD;
+            }
+            mcar_comm_send_target(vision_nav_target_seq(),
+                                  handheld_guidance.err_forward_px,
+                                  handheld_guidance.err_right_px,
+                                  0,
+                                  flags);
+        }
+        else
+        {
+            handheld_guidance.valid = 0u;
+            handheld_obs_held = 0u;
+            mcar_comm_send_stop(vision_nav_target_seq());
+        }
+        {
+            uint32_t send_us = system_time_us() - send_start_us;
+            if(send_us > debug_send_max_us) debug_send_max_us = send_us;
+        }
+        handheld_last_tx_us = now_us;
+    }
+
+    if((debug_last_us == 0u) || ((now_us - debug_last_us) >= 1000000u))
+    {
+        char debug_line[384];
+        int debug_len;
+        uint32_t frame_delta = last_frame_id - debug_last_frame_id;
+        uint32_t tx_delta = mcar_comm_diag.tx_count - debug_last_tx_count;
+        uint32_t rx_byte_delta = mcar_comm_diag.rx_byte_count -
+                                 debug_last_rx_byte_count;
+        uint32_t rx_bad_delta = mcar_comm_diag.rx_bad_frame_count -
+                                debug_last_rx_bad_count;
+        uint32_t vision_age_us = (last_frame_rx_us == 0u) ?
+            0xFFFFFFFFu : now_us - last_frame_rx_us;
+
+        debug_len = snprintf(
+            debug_line, sizeof(debug_line),
+            "[DEBUG-MCAR-1FPS],t=%lu,frame=%lu,df=%lu,tx=%lu,dtx=%lu,txdt=%lu,age=%lu,camdt=%lu,proc=%lu,disp=%lu,flags=0x%02X,gapmax=%lu,pollmax=%lu,sendmax=%lu,rxbyte=%lu,rxbad=%lu\r\n",
+            (unsigned long)now_us,
+            (unsigned long)last_frame_id,
+            (unsigned long)frame_delta,
+            (unsigned long)mcar_comm_diag.tx_count,
+            (unsigned long)tx_delta,
+            (unsigned long)mcar_comm_diag.tx_period_us,
+            (unsigned long)vision_age_us,
+            (unsigned long)vision_detection_snapshot.camera_dt_us,
+            (unsigned long)vision_detection_snapshot.process_us,
+            (unsigned long)vision_detection_snapshot.display_us,
+            (unsigned int)mcar_comm_diag.last_tx_flags,
+            (unsigned long)debug_call_gap_max_us,
+            (unsigned long)debug_poll_max_us,
+            (unsigned long)debug_send_max_us,
+            (unsigned long)rx_byte_delta,
+            (unsigned long)rx_bad_delta);
+        if(debug_len > 0)
+        {
+            uint32_t send_len = ((uint32_t)debug_len < sizeof(debug_line)) ?
+                (uint32_t)debug_len : (uint32_t)(sizeof(debug_line) - 1u);
+            debug_send_buffer((const uint8 *)debug_line, send_len);
+        }
+
+        debug_last_us = now_us;
+        debug_last_frame_id = last_frame_id;
+        debug_last_tx_count = mcar_comm_diag.tx_count;
+        debug_last_rx_byte_count = mcar_comm_diag.rx_byte_count;
+        debug_last_rx_bad_count = mcar_comm_diag.rx_bad_frame_count;
+        debug_call_gap_max_us = 0u;
+        debug_poll_max_us = 0u;
+        debug_send_max_us = 0u;
+    }
+#endif
 
     return have_new_frame;
 }

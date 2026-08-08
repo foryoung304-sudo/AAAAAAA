@@ -11,7 +11,7 @@
 #define MOTOR_DUTY_MIN_START  900
 #define MOTOR_DUTY_MAX        7500
 #define MOTOR_OUTPUT_DEADZONE 0.1f
-#define THROTTLE_MAX          40.0f
+#define THROTTLE_MAX          45.0f
 #define ROLL_MIX_DIR          (1.0f)
 #define PITCH_MIX_DIR         (1.0f)
 #define YAW_MIX_DIR           (1.0f)

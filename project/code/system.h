@@ -16,10 +16,10 @@
 #define HOVER_THR_MAP_VOLTAGE_MID_LOW    (11.7f)
 #define HOVER_THR_MAP_VOLTAGE_LOW        (11.4f)
 
-#define HOVER_THR_MAP_VALUE_HIGH         (28.3f)
-#define HOVER_THR_MAP_VALUE_MID_HIGH     (30.1f)
-#define HOVER_THR_MAP_VALUE_MID_LOW      (31.3f)
-#define HOVER_THR_MAP_VALUE_LOW          (32.4f)
+#define HOVER_THR_MAP_VALUE_HIGH         (31.5f)
+#define HOVER_THR_MAP_VALUE_MID_HIGH     (32.5f)
+#define HOVER_THR_MAP_VALUE_MID_LOW      (33.5f)
+#define HOVER_THR_MAP_VALUE_LOW          (34.7f)
 
 void system_power_init(void);
 void system_power_update(float dT_s);

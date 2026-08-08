@@ -13,7 +13,8 @@ static uint8_t worker_ycar_hole_map[WORKER_YCAR_HOLE_TEST_SIZE]
 static uint16_t worker_ycar_hole_queue[
     WORKER_YCAR_HOLE_TEST_SIZE * WORKER_YCAR_HOLE_TEST_SIZE];
 
-static image_t worker_undistorted_img =
+
+    static image_t worker_undistorted_img =
 {
     .data = &worker_undistorted[0][0],
     .width = MT9V03X_W,
@@ -112,7 +113,6 @@ void ips114_draw_filled_circle(uint16 x, uint16 y, uint16 radius,
                          (uint16)x1, (uint16)yy, color);
     }
 }
-
 static int vision_display_clamp_x(int x)
 {
     if(x < 0) return 0;
@@ -202,8 +202,8 @@ static void worker_stream_prepare(const VisionDetectionSnapshot_t *snapshot)
         worker_stream_draw_circle(hx, hy, 2);
     }
 }
-
-static void vision_worker_display(const VisionDetectionSnapshot_t *snapshot)
+static void vision_worker_display(const VisionDetectionSnapshot_t *snapshot,
+                                  const VisionAttitudeSample_t *attitude)
 {
 #if VISION_IPS114_ENABLE
     ips114_show_gray_image(VISION_IPS114_IMAGE_X, VISION_IPS114_IMAGE_Y,
@@ -242,8 +242,18 @@ static void vision_worker_display(const VisionDetectionSnapshot_t *snapshot)
                          (uint16)hx, (uint16)hy, RGB565_YELLOW);
         ips114_draw_filled_circle((uint16)hx, (uint16)hy, 2u, RGB565_YELLOW);
     }
+
+    /* Final signed pixel errors already placed in the CM7_0->car frame. */
+    ips114_set_color(RGB565_BLACK, RGB565_WHITE);
+    ips114_show_string(0u, 0u, "F:      ");
+    ips114_show_int(16u, 0u, attitude->car_tx_err_forward_px, 4u);
+    ips114_show_string(0u, 16u, "R:      ");
+    ips114_show_int(16u, 16u, attitude->car_tx_err_right_px, 4u);
+    ips114_show_string(0u, 32u, "M:   ");
+    ips114_show_uint(16u, 32u, attitude->flight_mode, 1u);
 #else
     (void)snapshot;
+    (void)attitude;
 #endif
 }
 
@@ -276,6 +286,57 @@ static void worker_remap(void)
     }
 }
 
+/* The fisheye/IR optical path loses brightness toward the image boundary.
+ * Keep the proven center thresholds, then lower them smoothly only in the
+ * outer 40 percent.  This borrows the completion build's tolerance for dim
+ * beacons without applying its global threshold of 90 to the whole frame. */
+static uint8_t worker_edge_compensated_threshold(int x, int y,
+                                                  uint8_t center_threshold,
+                                                  uint8_t edge_threshold)
+{
+    int dx2 = 2 * x - (MT9V03X_W - 1);
+    int dy2 = 2 * y - (MT9V03X_H - 1);
+    uint16_t nx;
+    uint16_t ny;
+    uint16_t radius_permille;
+    uint32_t threshold_drop;
+
+    if(dx2 < 0) dx2 = -dx2;
+    if(dy2 < 0) dy2 = -dy2;
+    nx = (uint16_t)((uint32_t)dx2 * 1000u / (MT9V03X_W - 1));
+    ny = (uint16_t)((uint32_t)dy2 * 1000u / (MT9V03X_H - 1));
+    radius_permille = (nx > ny) ? nx : ny;
+
+    if(radius_permille <= WORKER_EDGE_COMP_START_PERMILLE)
+    {
+        return center_threshold;
+    }
+    if(radius_permille >= 1000u)
+    {
+        return edge_threshold;
+    }
+
+    threshold_drop =
+        (uint32_t)(center_threshold - edge_threshold) *
+        (radius_permille - WORKER_EDGE_COMP_START_PERMILLE) /
+        (1000u - WORKER_EDGE_COMP_START_PERMILLE);
+    return (uint8_t)(center_threshold - threshold_drop);
+}
+
+static void worker_threshold_edge_compensated(void)
+{
+    for(int y = 0; y < MT9V03X_H; y++)
+    {
+        for(int x = 0; x < MT9V03X_W; x++)
+        {
+            uint8_t threshold = worker_edge_compensated_threshold(
+                x, y, IR_BINARY_THRESHOLD_CENTER, IR_BINARY_THRESHOLD_EDGE);
+            worker_binary[y][x] =
+                (worker_undistorted[y][x] >= threshold) ? 255u : 0u;
+        }
+    }
+}
+
 static float worker_base_score(const VisionBeaconCandidate_t *candidate)
 {
     float center_distance = (float)(MT9V03X_W / 2 - candidate->x);
@@ -304,6 +365,108 @@ static void worker_insert_candidate(VisionDetectionSnapshot_t *snapshot,
         at--;
     }
     snapshot->beacon_candidates[at] = candidate;
+}
+
+static uint8_t worker_try_fused_beacon_candidate(
+    const uint16_t area[],
+    const uint32_t sum_x[],
+    const uint32_t sum_y[],
+    const int16_t min_x[],
+    const int16_t max_x[],
+    const int16_t min_y[],
+    const int16_t max_y[],
+    uint8_t components,
+    VisionBeaconCandidate_t *candidate)
+{
+    int32_t best_distance_sq =
+        WORKER_BEACON_FUSED_TRACK_RADIUS_PX *
+        WORKER_BEACON_FUSED_TRACK_RADIUS_PX + 1;
+    uint8_t best_id = 0u;
+
+    if(worker_prev_x < 0 || worker_prev_y < 0) return 0u;
+
+    for(uint8_t id = 1u; id <= components; id++)
+    {
+        int16_t center_x;
+        int16_t center_y;
+        int32_t dx;
+        int32_t dy;
+        int32_t distance_sq;
+
+        if(area[id] <= WORKER_MAX_AREA) continue;
+        if(worker_prev_x < (min_x[id] - WORKER_BEACON_FUSED_TRACK_RADIUS_PX) ||
+           worker_prev_x > (max_x[id] + WORKER_BEACON_FUSED_TRACK_RADIUS_PX) ||
+           worker_prev_y < (min_y[id] - WORKER_BEACON_FUSED_TRACK_RADIUS_PX) ||
+           worker_prev_y > (max_y[id] + WORKER_BEACON_FUSED_TRACK_RADIUS_PX))
+        {
+            continue;
+        }
+
+        center_x = (int16_t)((sum_x[id] + area[id] / 2u) / area[id]);
+        center_y = (int16_t)((sum_y[id] + area[id] / 2u) / area[id]);
+        dx = center_x - worker_prev_x;
+        dy = center_y - worker_prev_y;
+        distance_sq = dx * dx + dy * dy;
+        if(distance_sq < best_distance_sq)
+        {
+            best_distance_sq = distance_sq;
+            best_id = id;
+        }
+    }
+
+    if(best_id != 0u)
+    {
+        uint32_t local_sum_x = 0u;
+        uint32_t local_sum_y = 0u;
+        uint32_t local_sum_v = 0u;
+        uint16_t local_count = 0u;
+        uint8_t threshold = worker_edge_compensated_threshold(
+            worker_prev_x, worker_prev_y,
+            WORKER_BEACON_THRESHOLD_CENTER,
+            WORKER_BEACON_THRESHOLD_EDGE);
+        int x0 = worker_prev_x - WORKER_BEACON_FUSED_WINDOW_RADIUS_PX;
+        int x1 = worker_prev_x + WORKER_BEACON_FUSED_WINDOW_RADIUS_PX;
+        int y0 = worker_prev_y - WORKER_BEACON_FUSED_WINDOW_RADIUS_PX;
+        int y1 = worker_prev_y + WORKER_BEACON_FUSED_WINDOW_RADIUS_PX;
+
+        if(x0 < min_x[best_id]) x0 = min_x[best_id];
+        if(x1 > max_x[best_id]) x1 = max_x[best_id];
+        if(y0 < min_y[best_id]) y0 = min_y[best_id];
+        if(y1 > max_y[best_id]) y1 = max_y[best_id];
+        if(x0 < 0) x0 = 0;
+        if(y0 < 0) y0 = 0;
+        if(x1 >= MT9V03X_W) x1 = MT9V03X_W - 1;
+        if(y1 >= MT9V03X_H) y1 = MT9V03X_H - 1;
+
+        for(int y = y0; y <= y1; y++)
+        {
+            for(int x = x0; x <= x1; x++)
+            {
+                if(worker_labels[y][x] == best_id &&
+                   worker_undistorted[y][x] >= threshold)
+                {
+                    local_sum_x += (uint32_t)x;
+                    local_sum_y += (uint32_t)y;
+                    local_sum_v += worker_undistorted[y][x];
+                    local_count++;
+                }
+            }
+        }
+
+        if(local_count >= WORKER_BEACON_FUSED_MIN_PIX)
+        {
+            candidate->x = (int16_t)((local_sum_x + local_count / 2u) /
+                                     local_count);
+            candidate->y = (int16_t)((local_sum_y + local_count / 2u) /
+                                     local_count);
+            candidate->area = local_count;
+            candidate->brightness = (uint16_t)(local_sum_v / local_count);
+            candidate->score = worker_base_score(candidate) + 35.0f;
+            return 1u;
+        }
+    }
+
+    return 0u;
 }
 
 static uint8_t worker_components_near(const int16_t min_x[], const int16_t max_x[],
@@ -656,7 +819,8 @@ static uint8_t worker_set_ycar_extrema_heading(
 static void worker_detect_ycar(VisionDetectionSnapshot_t *snapshot,
                                uint8_t components, const uint16_t area[],
                                const int16_t min_x[], const int16_t max_x[],
-                               const int16_t min_y[], const int16_t max_y[])
+                               const int16_t min_y[], const int16_t max_y[],
+                               uint8_t excluded_beacon_id)
 {
     uint8_t best_keep[WORKER_MAX_LABELS] = {0};
     uint16_t best_area = 0u;
@@ -671,14 +835,16 @@ static void worker_detect_ycar(VisionDetectionSnapshot_t *snapshot,
         int group_min_y = MT9V03X_H;
         int group_max_y = 0;
 
-        if(area[seed] < WORKER_YCAR_MIN_PART_AREA) continue;
+        if(seed == excluded_beacon_id ||
+           area[seed] < WORKER_YCAR_MIN_PART_AREA) continue;
         keep[seed] = 1u;
         while(changed != 0u)
         {
             changed = 0u;
             for(uint8_t i = 1u; i <= components; i++)
             {
-                if(keep[i] != 0u || area[i] < WORKER_YCAR_MIN_PART_AREA) continue;
+                if(i == excluded_beacon_id || keep[i] != 0u ||
+                   area[i] < WORKER_YCAR_MIN_PART_AREA) continue;
                 for(uint8_t j = 1u; j <= components; j++)
                 {
                     if(keep[j] == 0u) continue;
@@ -710,6 +876,16 @@ static void worker_detect_ycar(VisionDetectionSnapshot_t *snapshot,
             float aspect;
             float fill;
             if(width <= 0 || height <= 0) continue;
+            /* A clipped component has no trustworthy three-tip geometry.
+             * In particular, an undistorted round beacon at the top edge can
+             * otherwise look like a sparse elongated Y-car marker. */
+            if(group_min_x <= WORKER_YCAR_BORDER_MARGIN_PX ||
+               group_min_y <= WORKER_YCAR_BORDER_MARGIN_PX ||
+               group_max_x >= MT9V03X_W - 1 - WORKER_YCAR_BORDER_MARGIN_PX ||
+               group_max_y >= MT9V03X_H - 1 - WORKER_YCAR_BORDER_MARGIN_PX)
+            {
+                continue;
+            }
             aspect = (width > height) ? (float)width / height :
                                        (float)height / width;
             fill = (float)group_area / ((float)width * height);
@@ -1004,6 +1180,7 @@ static void worker_detect(VisionDetectionSnapshot_t *snapshot)
     int16_t max_y[WORKER_MAX_LABELS];
     uint8_t next_label = 1u;
     uint8_t components = 0u;
+    uint8_t tracked_beacon_component = 0u;
     float best_score = -100000.0f;
     float second_score = -100000.0f;
     int16_t best_x = 0;
@@ -1066,9 +1243,61 @@ static void worker_detect(VisionDetectionSnapshot_t *snapshot)
     }
 
     snapshot->blob_count = components;
+
+    /* When a confirmed beacon approaches the Y-car, the generic 6 px Y-car
+     * component merger must not absorb the still-separate round lamp.  Lock
+     * only a compact, bright component close to the previous beacon track;
+     * a truly fused lamp+car blob is deliberately not split and falls back to
+     * the existing short Y-car observation hold instead of inventing a yaw. */
+    if(worker_prev_x >= 0)
+    {
+        int32_t best_distance_sq =
+            WORKER_BEACON_YCAR_SPLIT_TRACK_RADIUS_PX *
+            WORKER_BEACON_YCAR_SPLIT_TRACK_RADIUS_PX + 1;
+        for(uint8_t id = 1u; id <= components; id++)
+        {
+            int width;
+            int height;
+            int16_t center_x;
+            int16_t center_y;
+            int32_t dx;
+            int32_t dy;
+            int32_t distance_sq;
+            float aspect;
+            float fill;
+            uint8_t threshold;
+
+            if(area[id] < WORKER_MIN_AREA ||
+               area[id] > WORKER_BEACON_YCAR_SPLIT_MAX_AREA) continue;
+            width = max_x[id] - min_x[id] + 1;
+            height = max_y[id] - min_y[id] + 1;
+            if(width <= 0 || height <= 0) continue;
+            aspect = (width > height) ? (float)width / height :
+                                       (float)height / width;
+            fill = (float)area[id] / ((float)width * height);
+            if(aspect >= WORKER_BEACON_ASPECT_MAX ||
+               fill <= WORKER_BEACON_YCAR_SPLIT_FILL_MIN) continue;
+            center_x = (int16_t)((sum_x[id] + area[id] / 2u) / area[id]);
+            center_y = (int16_t)((sum_y[id] + area[id] / 2u) / area[id]);
+            threshold = worker_edge_compensated_threshold(
+                center_x, center_y, WORKER_BEACON_THRESHOLD_CENTER,
+                WORKER_BEACON_THRESHOLD_EDGE);
+            if((sum_v[id] / area[id]) < threshold) continue;
+            dx = center_x - worker_prev_x;
+            dy = center_y - worker_prev_y;
+            distance_sq = dx * dx + dy * dy;
+            if(distance_sq < best_distance_sq)
+            {
+                best_distance_sq = distance_sq;
+                tracked_beacon_component = id;
+            }
+        }
+    }
+
     worker_ycar_shape_valid = 0u;
     worker_detect_ycar(snapshot, components, area,
-                       min_x, max_x, min_y, max_y);
+                       min_x, max_x, min_y, max_y,
+                       tracked_beacon_component);
     if(snapshot->ycar_valid != 0u)
     {
         worker_last_ycar_x = snapshot->ycar_x;
@@ -1087,10 +1316,14 @@ static void worker_detect(VisionDetectionSnapshot_t *snapshot)
     for(uint8_t id = 1u; id <= components; id++)
     {
         VisionBeaconCandidate_t candidate;
+        uint8_t beacon_threshold;
         int width;
         int height;
         float aspect;
         float fill;
+        float aspect_max;
+        float fill_min;
+        uint8_t touches_border;
         float score;
         if(area[id] < WORKER_MIN_AREA || area[id] > WORKER_MAX_AREA) continue;
         width = max_x[id] - min_x[id] + 1;
@@ -1098,12 +1331,26 @@ static void worker_detect(VisionDetectionSnapshot_t *snapshot)
         if(width <= 0 || height <= 0) continue;
         aspect = (width > height) ? (float)width / height : (float)height / width;
         fill = (float)area[id] / ((float)width * height);
+        touches_border =
+            (min_x[id] <= WORKER_BEACON_BORDER_MARGIN_PX ||
+             min_y[id] <= WORKER_BEACON_BORDER_MARGIN_PX ||
+             max_x[id] >= MT9V03X_W - 1 - WORKER_BEACON_BORDER_MARGIN_PX ||
+             max_y[id] >= MT9V03X_H - 1 - WORKER_BEACON_BORDER_MARGIN_PX) ? 1u : 0u;
+        aspect_max = (touches_border != 0u) ?
+            WORKER_BEACON_BORDER_ASPECT_MAX : WORKER_BEACON_ASPECT_MAX;
+        fill_min = (touches_border != 0u) ?
+            WORKER_BEACON_BORDER_FILL_MIN : WORKER_BEACON_FILL_MIN;
         candidate.x = (int16_t)((sum_x[id] + area[id] / 2u) / area[id]);
         candidate.y = (int16_t)((sum_y[id] + area[id] / 2u) / area[id]);
         candidate.area = area[id];
         candidate.brightness = (uint16_t)(sum_v[id] / area[id]);
         candidate.score = worker_base_score(&candidate);
-        if(candidate.brightness < WORKER_BEACON_THRESHOLD || aspect >= 1.7f || fill <= 0.35f) continue;
+        beacon_threshold = worker_edge_compensated_threshold(
+            candidate.x, candidate.y,
+            WORKER_BEACON_THRESHOLD_CENTER,
+            WORKER_BEACON_THRESHOLD_EDGE);
+        if(candidate.brightness < beacon_threshold ||
+           aspect >= aspect_max || fill <= fill_min) continue;
         if(worker_ycar_shape_valid != 0u)
         {
             int dx = candidate.x - worker_ycar_shape_x;
@@ -1148,6 +1395,21 @@ static void worker_detect(VisionDetectionSnapshot_t *snapshot)
             second_score = score;
             snapshot->beacon_second_x = candidate.x;
             snapshot->beacon_second_y = candidate.y;
+        }
+    }
+
+    if(best_score <= -99999.0f)
+    {
+        VisionBeaconCandidate_t fused_candidate;
+        if(worker_try_fused_beacon_candidate(area, sum_x, sum_y,
+                                             min_x, max_x, min_y, max_y,
+                                             components,
+                                             &fused_candidate) != 0u)
+        {
+            worker_insert_candidate(snapshot, fused_candidate);
+            best_score = fused_candidate.score;
+            best_x = fused_candidate.x;
+            best_y = fused_candidate.y;
         }
     }
 
@@ -1203,15 +1465,22 @@ void vision_worker_init(void)
                                                  MT9V03X_H);
 #endif
 #if VISION_IPS114_ENABLE
+
     ips114_set_dir(VISION_IPS114_DIR);
     ips114_init();
-    ips114_full(RGB565_BLACK);
+    ips114_full(RGB565_WHITE);
+    //ips114_set_font(IPS114_8X16_FONT);
+    //ips114_set_color(RGB565_BLACK, RGB565_WHITE);
+   // ips114_show_string(0u, 0u, "BASE MISSION");
+   // ips114_show_string(0u, 16u, "FIELD MAP: OFF");
+    IPS114_BLK(1);
 #endif
     timer_init(TC_TIME2_CH1, TIMER_US);
     timer_clear(TC_TIME2_CH1);
     timer_start(TC_TIME2_CH1);
     mt9v03x_set_timestamp_source(vision_worker_time_us);
     mt9v03x_init();
+    mt9v03x_set_exposure_time(EXPOSURE_TIME);
 }
 
 uint8_t vision_worker_process(void)
@@ -1226,6 +1495,7 @@ uint8_t vision_worker_process(void)
     process_start_us = vision_worker_time_us();
     camera_timestamp_us = mt9v03x_frame_timestamp_us;
     memset(&snapshot, 0, sizeof(snapshot));
+    memset(&attitude, 0, sizeof(attitude));
     snapshot.timestamp_us = camera_timestamp_us;
     snapshot.camera_dt_us = (worker_last_camera_timestamp_us == 0u) ? 0u :
         camera_timestamp_us - worker_last_camera_timestamp_us;
@@ -1244,8 +1514,9 @@ uint8_t vision_worker_process(void)
 
     memcpy(worker_base, mt9v03x_image, MT9V03X_IMAGE_SIZE);
     worker_remap();
-    threshold_fixed(&worker_undistorted_img, &worker_binary_img,
-                    IR_BINARY_THRESHOLD, 0u, 255u);
+     threshold_fixed(&worker_undistorted_img, &worker_binary_img,
+                    220, 0u, 255u);
+    worker_threshold_edge_compensated();
     worker_detect(&snapshot);
     snapshot.frame_id = ++worker_frame_id;
     snapshot.process_us = vision_worker_time_us() - process_start_us;
@@ -1261,7 +1532,7 @@ uint8_t vision_worker_process(void)
     if((worker_frame_id % VISION_IPS114_FRAME_DIVIDER) == 0u)
     {
         uint32_t display_start_us = vision_worker_time_us();
-        vision_worker_display(&snapshot);
+        vision_worker_display(&snapshot, &attitude);
         worker_last_display_us = vision_worker_time_us() - display_start_us;
     }
 #endif

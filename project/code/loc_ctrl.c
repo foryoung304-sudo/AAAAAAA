@@ -44,6 +44,7 @@ static loc_runtime_t loc_rt =
 {
     .last_flight_mode = FLY_POS_HOLD
 };
+static uint8_t loc_horizontal_fault_last = 0u;
 
 
 // ============================================================================
@@ -83,8 +84,23 @@ static uint8_t loc_auto_low_height_mode(void)
             (vehicle_state.flight_mode == FLY_AUTOLANDING)) ? 1u : 0u;
 }
 
+static uint8_t loc_auto_takeoff_mode(void)
+{
+    return (vehicle_state.flight_mode == FLY_AUTOTAKEOFF) ? 1u : 0u;
+}
+
 static float loc_damping_enable_height(void)
 {
+    if(loc_auto_takeoff_mode() != 0u)
+    {
+        if((loc_rt.loc_ready_last != 0u) ||
+           (loc_rt.loc_hold_active != 0u))
+        {
+            return LOC_AUTO_TAKEOFF_HORIZONTAL_RELEASE_HEIGHT_CM;
+        }
+        return LOC_AUTO_TAKEOFF_HORIZONTAL_ENABLE_HEIGHT_CM;
+    }
+
     return (loc_auto_low_height_mode() != 0u) ?
            LOC_AUTO_LOW_ENABLE_HEIGHT_CM : LOC_ENABLE_HEIGHT_CM;
 }
@@ -100,8 +116,13 @@ static float loc_hold_enable_height(void)
     /* Horizontal authority must not move upward with a higher altitude goal.
      * Start damping at LOC_ENABLE_HEIGHT_CM, then allow position capture at a
      * fixed, proven height while the altitude profile continues climbing. */
+    if(loc_auto_takeoff_mode() != 0u)
+    {
+        return LOC_AUTO_LOW_HOLD_HEIGHT_CM;
+    }
+
     return (loc_auto_low_height_mode() != 0u) ?
-           LOC_AUTO_LOW_HOLD_HEIGHT_CM : LOC_HOLD_ENABLE_HEIGHT_CM;
+           LOC_AUTO_LOW_LANDING_HOLD_HEIGHT_CM : LOC_HOLD_ENABLE_HEIGHT_CM;
 }
 
 static uint8_t loc_hold_entry_ready(void)
@@ -123,9 +144,9 @@ static uint8_t loc_hold_entry_ready(void)
     }
 
     /*
-     * Automatic takeoff/landing already owns a fixed horizontal target.
-     * Requiring normal low-speed entry can prevent capture after an early
-     * cable or ground-effect disturbance. Let the velocity loop brake it.
+     * Automatic modes capture the current point when hold starts.  Once the
+     * height, vertical-speed and attitude gates are valid, waiting for low
+     * horizontal speed can deadlock takeoff after an early disturbance.
      */
     if(loc_auto_low_height_mode() != 0u)
     {
@@ -315,17 +336,20 @@ static void loc_update_position_profile(float goal_x,
         (LOC_PROFILE_BLEND_END_CM - LOC_PROFILE_BLEND_START_CM));
     profile_speed_limit = LOC_PROFILE_NEAR_SPEED_CM_S +
         (LOC_PROFILE_FAR_SPEED_CM_S - LOC_PROFILE_NEAR_SPEED_CM_S) * speed_blend;
-    if((vision_nav_obs.search_move_active != 0u) &&
+    if((vehicle_state.flight_mode == FLY_AUTOFLY) &&
+       (vision_nav_obs.search_move_active != 0u) &&
        (profile_speed_limit > VISION_NAV_SEARCH_SPEED_LIMIT_CM_S))
     {
         profile_speed_limit = VISION_NAV_SEARCH_SPEED_LIMIT_CM_S;
     }
-    if((vision_nav_obs.approach_active != 0u) &&
+    if((vehicle_state.flight_mode == FLY_AUTOFLY) &&
+       (vision_nav_obs.approach_active != 0u) &&
        (profile_speed_limit > VISION_NAV_APPROACH_SPEED_LIMIT_CM_S))
     {
         profile_speed_limit = VISION_NAV_APPROACH_SPEED_LIMIT_CM_S;
     }
-    if((vision_nav_obs.car_follow_active != 0u) &&
+    if((vehicle_state.flight_mode == FLY_AUTOFLY) &&
+       (vision_nav_obs.car_follow_active != 0u) &&
        (profile_speed_limit > VISION_NAV_CAR_FOLLOW_SPEED_LIMIT_CM_S))
     {
         profile_speed_limit = VISION_NAV_CAR_FOLLOW_SPEED_LIMIT_CM_S;
@@ -342,6 +366,161 @@ static void loc_update_position_profile(float goal_x,
     desired_speed *= tracking_scale;
     desired_vx = desired_speed * dx / distance;
     desired_vy = desired_speed * dy / distance;
+
+    if((vehicle_state.flight_mode == FLY_AUTOFLY) &&
+       (vision_nav_obs.search_move_active != 0u))
+    {
+        float search_center_x;
+        float search_center_y;
+        float min_x;
+        float max_x;
+        float min_y;
+        float max_y;
+        float boundary_distance;
+        float outward_speed_limit;
+
+        vision_nav_get_search_center(&search_center_x, &search_center_y);
+        min_x = search_center_x - VISION_NAV_SEARCH_HALF_WIDTH_X_CM;
+        max_x = search_center_x + VISION_NAV_SEARCH_HALF_WIDTH_X_CM;
+        min_y = search_center_y - VISION_NAV_SEARCH_HALF_WIDTH_Y_CM;
+        max_y = search_center_y + VISION_NAV_SEARCH_HALF_WIDTH_Y_CM;
+
+        /*
+         * Keep full cruise speed in the field interior.  Within 60 cm of an
+         * outer search edge, reduce only the velocity component pointing out
+         * of the field: 100 -> 20 cm/s between 60 and 30 cm, then 20 -> 0
+         * cm/s at the edge.  Tangential lane speed is not reduced.
+         */
+        if(desired_vx < 0.0f)
+        {
+            boundary_distance = vehicle_state.current_pos_x - min_x;
+            if(boundary_distance < VISION_NAV_SEARCH_BOUNDARY_BRAKE_START_CM)
+            {
+                if(boundary_distance <= 0.0f)
+                {
+                    outward_speed_limit = 0.0f;
+                }
+                else if(boundary_distance <=
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_CM)
+                {
+                    outward_speed_limit =
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S *
+                        boundary_distance /
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_CM;
+                }
+                else
+                {
+                    outward_speed_limit =
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S +
+                        (VISION_NAV_SEARCH_SPEED_LIMIT_CM_S -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S) *
+                        (boundary_distance -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_CM) /
+                        (VISION_NAV_SEARCH_BOUNDARY_BRAKE_START_CM -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_CM);
+                }
+                if(desired_vx < -outward_speed_limit)
+                    desired_vx = -outward_speed_limit;
+            }
+        }
+        else if(desired_vx > 0.0f)
+        {
+            boundary_distance = max_x - vehicle_state.current_pos_x;
+            if(boundary_distance < VISION_NAV_SEARCH_BOUNDARY_BRAKE_START_CM)
+            {
+                if(boundary_distance <= 0.0f)
+                {
+                    outward_speed_limit = 0.0f;
+                }
+                else if(boundary_distance <=
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_CM)
+                {
+                    outward_speed_limit =
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S *
+                        boundary_distance /
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_CM;
+                }
+                else
+                {
+                    outward_speed_limit =
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S +
+                        (VISION_NAV_SEARCH_SPEED_LIMIT_CM_S -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S) *
+                        (boundary_distance -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_CM) /
+                        (VISION_NAV_SEARCH_BOUNDARY_BRAKE_START_CM -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_CM);
+                }
+                if(desired_vx > outward_speed_limit)
+                    desired_vx = outward_speed_limit;
+            }
+        }
+
+        if(desired_vy < 0.0f)
+        {
+            boundary_distance = vehicle_state.current_pos_y - min_y;
+            if(boundary_distance < VISION_NAV_SEARCH_BOUNDARY_BRAKE_START_CM)
+            {
+                if(boundary_distance <= 0.0f)
+                {
+                    outward_speed_limit = 0.0f;
+                }
+                else if(boundary_distance <=
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_CM)
+                {
+                    outward_speed_limit =
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S *
+                        boundary_distance /
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_CM;
+                }
+                else
+                {
+                    outward_speed_limit =
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S +
+                        (VISION_NAV_SEARCH_SPEED_LIMIT_CM_S -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S) *
+                        (boundary_distance -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_CM) /
+                        (VISION_NAV_SEARCH_BOUNDARY_BRAKE_START_CM -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_CM);
+                }
+                if(desired_vy < -outward_speed_limit)
+                    desired_vy = -outward_speed_limit;
+            }
+        }
+        else if(desired_vy > 0.0f)
+        {
+            boundary_distance = max_y - vehicle_state.current_pos_y;
+            if(boundary_distance < VISION_NAV_SEARCH_BOUNDARY_BRAKE_START_CM)
+            {
+                if(boundary_distance <= 0.0f)
+                {
+                    outward_speed_limit = 0.0f;
+                }
+                else if(boundary_distance <=
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_CM)
+                {
+                    outward_speed_limit =
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S *
+                        boundary_distance /
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_CM;
+                }
+                else
+                {
+                    outward_speed_limit =
+                        VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S +
+                        (VISION_NAV_SEARCH_SPEED_LIMIT_CM_S -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_SPEED_CM_S) *
+                        (boundary_distance -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_CM) /
+                        (VISION_NAV_SEARCH_BOUNDARY_BRAKE_START_CM -
+                         VISION_NAV_SEARCH_BOUNDARY_NEAR_CM);
+                }
+                if(desired_vy > outward_speed_limit)
+                    desired_vy = outward_speed_limit;
+            }
+        }
+    }
 
     dv_x = desired_vx - loc_rt.profile_vel_x;
     dv_y = desired_vy - loc_rt.profile_vel_y;
@@ -546,7 +725,7 @@ void loc_ctrl_init(void)
 {
     // 位置环PID参数（外环）
     loc_ctrl.pos_pid[0] = (pid_param_t){     // X方向
-        .kp = 1.0f,
+        .kp = 0.351f,
         .ki = 0.0f,
         .kd = 0.0f,
         .i_max = 0.0f,
@@ -556,7 +735,7 @@ void loc_ctrl_init(void)
     };
     
     loc_ctrl.pos_pid[1] = (pid_param_t){     // Y方向
-        .kp = 1.0f,
+        .kp = 0.311f,
         .ki = 0.0f,
         .kd = 0.0f,
         .i_max = 0.0f,
@@ -568,9 +747,9 @@ void loc_ctrl_init(void)
     /* Velocity PID output is horizontal acceleration (cm/s^2), not angle.
      * The acceleration command is converted to lean angle explicitly below. */
     loc_ctrl.vel_pid[0] = (pid_param_t){     // Vx方向
-        .kp = 2.0f,
-        .ki = 1.0f,
-        .kd = 0.03f,
+        .kp = 1.112f,
+        .ki = 0.2435f,
+        .kd = 0.051f,
         .i_max = 20.0f,
         .p_max = LOC_MAX_HORIZONTAL_ACCEL_CM_S2,
         .d_max = 30.0f,
@@ -578,9 +757,9 @@ void loc_ctrl_init(void)
     };
     
     loc_ctrl.vel_pid[1] = (pid_param_t){     // Vy方向
-        .kp = 2.0f,
-        .ki = 1.0f,
-        .kd = 0.03f,
+        .kp = 1.2081f,
+        .ki = 0.230f,
+        .kd = 0.0605f,
         .i_max = 20.0f,
         .p_max = LOC_MAX_HORIZONTAL_ACCEL_CM_S2,
         .d_max = 30.0f,
@@ -623,11 +802,9 @@ void loc_2level_ctrl(float dT_s)
 
         if(loc_hold_ready() == 0u)
         {
-            if(loc_auto_low_height_mode() == 0u)
-            {
-                vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
-                vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
-            }
+            /* Between the low takeoff damping gate and the position-hold
+             * gate, keep the launch target fixed. Replacing it with the
+             * current estimate accepts drift before the later Yaw hold. */
             vehicle_setpoint.target_vel_x = 0.0f;
             vehicle_setpoint.target_vel_y = 0.0f;
 
@@ -670,7 +847,46 @@ void loc_2level_ctrl(float dT_s)
             LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S +
             (LOC_TOTAL_VEL_LIMIT_CM_S - LOC_TERMINAL_TOTAL_VEL_LIMIT_CM_S) *
             terminal_blend;
-
+        float position_gain_scale = 1.0f;
+        uint8_t mission_motion_authorized =
+            (vehicle_state.flight_mode == FLY_AUTOFLY) ? 1u : 0u;
+        uint8_t car_motion_active =
+            ((mission_motion_authorized != 0u) &&
+             ((vision_nav_obs.car_follow_active != 0u) ||
+              (vision_nav_obs.car_prediction_active != 0u))) ? 1u : 0u;
+        uint8_t search_motion_active =
+            ((mission_motion_authorized != 0u) &&
+             (vision_nav_obs.search_move_active != 0u)) ? 1u : 0u;
+        uint8_t moving_target_active =
+            ((car_motion_active != 0u) ||
+             (search_motion_active != 0u)) ? 1u : 0u;
+        if(vision_nav_yaw_spin_is_active() != 0u)
+        {
+            /* Yaw rotation is a stationary hold, but the normal terminal
+             * profile is intentionally soft.  Stiffen only this phase so
+             * optical-flow drift creates an earlier return command without
+             * changing the mission/car-follow tuning. */
+            position_gain_scale = LOC_YAW_SPIN_POS_GAIN_SCALE;
+            pos_correction_limit =
+                LOC_YAW_SPIN_POS_CORRECTION_LIMIT_CM_S;
+            total_vel_limit = LOC_YAW_SPIN_TOTAL_VEL_LIMIT_CM_S;
+        }
+        if(moving_target_active != 0u)
+        {
+#if VISION_NAV_SIMPLE_DIRECT_CAR_FOLLOW
+            /* The simple completion profile has no moving-car feed-forward.
+             * Its direct visual correction and every search leg therefore
+             * get a true vector-speed cap at the final LOC output. */
+            total_vel_limit = (car_motion_active != 0u) ?
+                VISION_NAV_CAR_FOLLOW_SPEED_LIMIT_CM_S :
+                VISION_NAV_SEARCH_SPEED_LIMIT_CM_S;
+#else
+            /* A moving car is not a terminal stationary waypoint.  Keep the
+             * full vector-speed budget so its velocity feed-forward survives
+             * even when the spacing error is small. */
+            total_vel_limit = LOC_TOTAL_VEL_LIMIT_CM_S;
+#endif
+        }
         loc_update_position_profile(vehicle_setpoint.target_pos_x,
                                     vehicle_setpoint.target_pos_y,
                                     dT_s);
@@ -695,9 +911,11 @@ void loc_2level_ctrl(float dT_s)
                                                   loc_rt.profile_vel_y);
 
         loc_2l_ct.exp_vel_x = profile_ff_x + LIMIT(
+            position_gain_scale *
             stan_pid_solve(&loc_ctrl.pos_pid[0], goal_err_x, dT_s, 0),
             -pos_correction_limit, pos_correction_limit);
         loc_2l_ct.exp_vel_y = profile_ff_y + LIMIT(
+            position_gain_scale *
             stan_pid_solve(&loc_ctrl.pos_pid[1], goal_err_y, dT_s, 0),
             -pos_correction_limit, pos_correction_limit);
 
@@ -715,10 +933,59 @@ void loc_2level_ctrl(float dT_s)
                                         -brake_speed_y,
                                         brake_speed_y);
 
+        if((mission_height_recovery_active != 0u) &&
+           (car_motion_active != 0u))
+        {
+            /* During altitude recovery this vector is the aircraft's motion
+             * relative to the moving car: profile feed-forward plus spacing
+             * correction.  Limit only that relative motion.  The measured
+             * car feed-forward is added below and must survive, otherwise a
+             * 25 cm/s total cap makes the tether pull the aircraft down when
+             * the car is moving faster. */
+            float relative_speed = sqrtf(
+                loc_2l_ct.exp_vel_x * loc_2l_ct.exp_vel_x +
+                loc_2l_ct.exp_vel_y * loc_2l_ct.exp_vel_y);
+            if(relative_speed >
+               MISSION_HEIGHT_RECOVERY_RELATIVE_SPEED_LIMIT_CM_S)
+            {
+                float relative_scale =
+                    MISSION_HEIGHT_RECOVERY_RELATIVE_SPEED_LIMIT_CM_S /
+                    relative_speed;
+                loc_2l_ct.exp_vel_x *= relative_scale;
+                loc_2l_ct.exp_vel_y *= relative_scale;
+            }
+        }
+        else if((mission_height_recovery_active != 0u) &&
+                (total_vel_limit >
+                 MISSION_HEIGHT_RECOVERY_RELATIVE_SPEED_LIMIT_CM_S))
+        {
+            /* With no valid moving-car feed-forward, retain the conservative
+             * absolute recovery limit. */
+            total_vel_limit =
+                MISSION_HEIGHT_RECOVERY_RELATIVE_SPEED_LIMIT_CM_S;
+        }
+
+        if(car_motion_active != 0u)
+        {
+            /* Position/profile terms close the spacing error; the measured
+             * car velocity moves that spacing target with the car.  Add this
+             * after the stationary-waypoint braking envelope so feed-forward
+             * is not clipped merely because the spacing error is small. */
+            loc_2l_ct.exp_vel_x += vision_nav_obs.car_ff_vel_x_cm_s;
+            loc_2l_ct.exp_vel_y += vision_nav_obs.car_ff_vel_y_cm_s;
+        }
+        if(search_motion_active != 0u)
+        {
+            loc_2l_ct.exp_vel_x += vision_nav_obs.search_ff_vel_x_cm_s;
+            loc_2l_ct.exp_vel_y += vision_nav_obs.search_ff_vel_y_cm_s;
+        }
+
         float target_vel_x = loc_2l_ct.exp_vel_x;
         float target_vel_y = loc_2l_ct.exp_vel_y;
         float target_speed = sqrtf(target_vel_x * target_vel_x +
                                    target_vel_y * target_vel_y);
+        float target_vel_slew_cm_s2 = LOC_TARGET_VEL_SLEW_CM_S2;
+        uint8_t car_stop_decel_active = 0u;
         uint8_t recovery_brake_active = 0u;
         float recovery_closing_speed = 0.0f;
         float recovery_stop_speed = 0.0f;
@@ -736,7 +1003,7 @@ void loc_2level_ctrl(float dT_s)
          * remaining distance.  A position-only target keeps asking for a
          * small toward-goal velocity even when the aircraft is already
          * crossing the target far too fast to stop in time. */
-        if(goal_distance > 0.5f)
+        if((goal_distance > 0.5f) && (moving_target_active == 0u))
         {
             float goal_unit_x = goal_err_x / goal_distance;
             float goal_unit_y = goal_err_y / goal_distance;
@@ -760,21 +1027,55 @@ void loc_2level_ctrl(float dT_s)
             loc_1l_ct.recovery_stop_speed = recovery_stop_speed;
             loc_1l_ct.recovery_brake_active = recovery_brake_active;
 
-            loc_rt.target_vel_x_ramped =
-                ctrl_slew_limit(loc_rt.target_vel_x_ramped,
-                                target_vel_x,
-                                (recovery_brake_active != 0u) ?
-                                LOC_RECOVERY_BRAKE_VEL_SLEW_CM_S2 :
-                                LOC_TARGET_VEL_SLEW_CM_S2,
-                                dT_s);
+            if(recovery_brake_active != 0u)
+            {
+                target_vel_slew_cm_s2 =
+                    LOC_RECOVERY_BRAKE_VEL_SLEW_CM_S2;
+            }
+            if((mission_motion_authorized != 0u) &&
+               (vision_nav_obs.car_stop_brake_active != 0u))
+            {
+                float ramped_speed = sqrtf(
+                    loc_rt.target_vel_x_ramped * loc_rt.target_vel_x_ramped +
+                    loc_rt.target_vel_y_ramped * loc_rt.target_vel_y_ramped);
+                if(target_speed < ramped_speed)
+                {
+                    target_vel_slew_cm_s2 =
+                        LOC_CAR_STOP_BRAKE_VEL_SLEW_CM_S2;
+                    car_stop_decel_active = 1u;
+                }
+            }
 
-            loc_rt.target_vel_y_ramped =
-                ctrl_slew_limit(loc_rt.target_vel_y_ramped,
-                                target_vel_y,
-                                (recovery_brake_active != 0u) ?
-                                LOC_RECOVERY_BRAKE_VEL_SLEW_CM_S2 :
-                                LOC_TARGET_VEL_SLEW_CM_S2,
-                                dT_s);
+            if(car_stop_decel_active != 0u)
+            {
+                float dv_x = target_vel_x - loc_rt.target_vel_x_ramped;
+                float dv_y = target_vel_y - loc_rt.target_vel_y_ramped;
+                float dv = sqrtf(dv_x * dv_x + dv_y * dv_y);
+                float max_dv = target_vel_slew_cm_s2 * dT_s;
+
+                if((dv > max_dv) && (dv > 0.001f))
+                {
+                    float scale = max_dv / dv;
+                    dv_x *= scale;
+                    dv_y *= scale;
+                }
+                loc_rt.target_vel_x_ramped += dv_x;
+                loc_rt.target_vel_y_ramped += dv_y;
+            }
+            else
+            {
+                loc_rt.target_vel_x_ramped =
+                    ctrl_slew_limit(loc_rt.target_vel_x_ramped,
+                                    target_vel_x,
+                                    target_vel_slew_cm_s2,
+                                    dT_s);
+
+                loc_rt.target_vel_y_ramped =
+                    ctrl_slew_limit(loc_rt.target_vel_y_ramped,
+                                    target_vel_y,
+                                    target_vel_slew_cm_s2,
+                                    dT_s);
+            }
 
         vehicle_setpoint.target_vel_x = loc_rt.target_vel_x_ramped;
         vehicle_setpoint.target_vel_y = loc_rt.target_vel_y_ramped;
@@ -830,7 +1131,11 @@ void loc_1level_ctrl(float dT_s)
         float vel_err_x_body;
         float vel_err_y_body;
 
-        if(loc_hold_ready() != 0u)
+        if((loc_hold_ready() != 0u) &&
+           ((vehicle_state.flight_mode != FLY_AUTOFLY) ||
+            ((vision_nav_obs.car_follow_active == 0u) &&
+             (vision_nav_obs.car_prediction_active == 0u) &&
+             (vision_nav_obs.search_spiral_active == 0u))))
         {
             float goal_err_x = vehicle_setpoint.target_pos_x -
                                vehicle_state.current_pos_x;
@@ -1003,6 +1308,33 @@ void loc_1level_ctrl(float dT_s)
             angle_limit = fminf(angle_limit,
                                 LOC_AUTO_LOW_MAX_OUTPUT_ANGLE_DEG);
         }
+        if((loc_auto_takeoff_mode() != 0u) &&
+           (vehicle_state.current_height <
+            LOC_AUTO_TAKEOFF_INITIAL_ANGLE_LIMIT_HEIGHT_CM))
+        {
+            angle_limit = fminf(
+                angle_limit,
+                LOC_AUTO_TAKEOFF_INITIAL_MAX_OUTPUT_ANGLE_DEG);
+        }
+        if(vision_nav_yaw_spin_is_active() != 0u)
+        {
+            angle_limit = fminf(angle_limit,
+                                VISION_NAV_YAW_SPIN_LOC_ANGLE_DEG);
+        }
+        if((vehicle_state.flight_mode == FLY_AUTOFLY) &&
+           (vision_nav_obs.car_height_recovery_active != 0u))
+        {
+            /* Keep matching the car's velocity, but reserve thrust for the
+             * 140 cm altitude recovery instead of spending it on a large
+             * spacing-error bank angle. */
+            angle_limit = fminf(angle_limit,
+                                VISION_NAV_CAR_RECOVERY_MAX_ANGLE_DEG);
+        }
+        if(vision_nav_obs.horizontal_fault_active != 0u)
+        {
+            angle_limit = fminf(angle_limit,
+                                LOC_HORIZONTAL_FAULT_MAX_ANGLE_DEG);
+        }
 
         /* Feed the real downstream authority limit back to the velocity PID.
          * stan_pid_solve() then freezes only integration that would push
@@ -1066,14 +1398,49 @@ void loc_ctrl_update(float dT_s)
     // 检查状态
     if((vehicle_state.flight_mode != loc_rt.last_flight_mode) &&
        ((vehicle_state.flight_mode == FLY_POS_HOLD) ||
+        (vehicle_state.flight_mode == FLY_AUTOFLY) ||
         (vehicle_state.flight_mode == FLY_AUTOTAKEOFF) ||
         (vehicle_state.flight_mode == FLY_AUTOLANDING)))
     {
         vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
         vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+
+        /* AUTOFLY and AUTOLANDING both take ownership from a moving target.
+         * Do not carry the old profile velocity, velocity-I bias or attitude
+         * ramp into either transition.  Landing must brake around its newly
+         * captured point before vertical descent begins. */
+        if((vehicle_state.flight_mode == FLY_AUTOFLY) ||
+           (vehicle_state.flight_mode == FLY_AUTOLANDING))
+        {
+            vehicle_setpoint.target_vel_x = 0.0f;
+            vehicle_setpoint.target_vel_y = 0.0f;
+            loc_reset_position_profile(vehicle_state.current_pos_x,
+                                       vehicle_state.current_pos_y);
+            loc_reset_runtime_output();
+            loc_reset_pids();
+            loc_reset_vel_debug();
+        }
     }
 
     loc_rt.last_flight_mode = vehicle_state.flight_mode;
+
+    if(vision_nav_obs.horizontal_fault_active != 0u)
+    {
+        vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
+        vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
+        vehicle_setpoint.target_vel_x = 0.0f;
+        vehicle_setpoint.target_vel_y = 0.0f;
+        loc_reset_position_profile(vehicle_state.current_pos_x,
+                                   vehicle_state.current_pos_y);
+        if(loc_horizontal_fault_last == 0u)
+        {
+            loc_reset_runtime_output();
+            loc_reset_pids();
+            loc_reset_vel_debug();
+        }
+    }
+    loc_horizontal_fault_last =
+        vision_nav_obs.horizontal_fault_active;
 
     ready = loc_output_ready();
     if(ready == 0u)
@@ -1126,12 +1493,9 @@ void loc_ctrl_update(float dT_s)
                 if((loc_auto_low_height_mode() != 0u) ||
                    (loc_rt.loc_hold_stable_time_s >= 0.3f))
                 {
-                    /* Automatic takeoff/landing already owns a latched target. */
-                    if(loc_auto_low_height_mode() == 0u)
-                    {
-                        vehicle_setpoint.target_pos_x = vehicle_state.current_pos_x;
-                        vehicle_setpoint.target_pos_y = vehicle_state.current_pos_y;
-                    }
+                    /* Automatic takeoff preserves the target captured on
+                     * mode entry, so hold corrects early drift instead of
+                     * declaring the displaced point to be the new origin. */
                     loc_2l_ct.exp_pos_x = vehicle_state.current_pos_x;
                     loc_2l_ct.exp_pos_y = vehicle_state.current_pos_y;
                     loc_reset_position_profile(vehicle_state.current_pos_x,

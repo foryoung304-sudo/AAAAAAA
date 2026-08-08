@@ -10,6 +10,7 @@
 #define MAX_YAW_SPEED 7.0f       // 最大偏航速度
 #define MAX_ATT1_VAL   10.0f        // 角速率环最大输出 (°/s)
 #define MAX_YAW_CT_VAL 7.0f        // 偏航控制输出最大
+#define ATT_TAKEOFF_YAW_HEADING_ENABLE_HEIGHT_CM 30.0f
   
 // 姿态控制结构体
 typedef struct {
@@ -23,6 +24,7 @@ typedef struct {
 
 extern attitude_control_t att_ctrl;// 角度环数据结构
 extern float att_voltage_output_scale;
+extern uint8_t att_takeoff_yaw_rate_hold_active;
 typedef struct 
 {
     float exp_rol;
@@ -62,6 +64,7 @@ extern ct_val_t ct_val;
 
 // 初始化
 void att_ctrl_init(void);
+void att_ctrl_set_yaw_target(float yaw_deg);
 
 
 // 角度环控制（外环）
